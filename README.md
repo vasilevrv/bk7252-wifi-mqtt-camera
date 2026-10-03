@@ -74,10 +74,10 @@ Individual components retain their upstream licenses. This repository does not a
 
 Requirements: Git, **Python 2.7**, Python 3 and **ARM GCC 5.4-2016q3**. SCons 3.1.2 is already included. The original toolchain bundled with the upstream project targets Linux; on macOS use the matching macOS toolchain. Its x86_64 binaries require Rosetta on Apple Silicon.
 
-Clone your OpenCam fork, then build:
+Clone this OpenCam fork, then build:
 
 ```sh
-git clone --recurse-submodules <your-opencam-fork-url> beken7252-opencam
+git clone --recurse-submodules https://github.com/vasilevrv/bk7252-wifi-mqtt-camera.git beken7252-opencam
 cd beken7252-opencam
 PYTHON2=/path/to/python2.7 \
 RTT_EXEC_PATH=/path/to/gcc-arm-none-eabi-5_4-2016q3/bin \
