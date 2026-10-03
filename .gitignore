@@ -1,1 +1,10 @@
 bootloader
+__pycache__/
+*.py[cod]
+.DS_Store
+/sd/wifi.conf
+/sd/mqtt.conf
+/build-local/
+/firmware/
+*.md
+!/README.md

@@ -1,0 +1,3249 @@
+diff --git a/beken378/app/app.c b/beken378/app/app.c
+index b057538..e92a70d 100644
+--- a/beken378/app/app.c
++++ b/beken378/app/app.c
+@@ -12,6 +12,8 @@
+ #include "mem_pub.h"
+ #include "rwnx_config.h"
+ #include "app.h"
++#include "cam_net_diag.h"
++#include <rtthread.h>
+ 
+ #if (NX_POWERSAVE)
+ #include "ps.h"
+@@ -155,6 +157,7 @@ void bmsg_tx_handler(BUS_MSG_T *msg)
+         if(q == p)
+         {
+             // must be out of memory
++            ++cam_net_counters.coalesce_fail;
+             goto tx_handler_exit;
+         }
+     }
+@@ -428,7 +431,13 @@ int bmsg_tx_sender(struct pbuf *p, uint32_t vif_idx)
+     msg.sema = NULL;
+ 
+     pbuf_ref(p);
+-    ret = rtos_push_to_queue(&g_wifi_core.io_queue, &msg, 1 * SECONDS);
++    { uint32_t before=rt_tick_get(),elapsed;
++      ret = rtos_push_to_queue(&g_wifi_core.io_queue, &msg, 1 * SECONDS);
++      elapsed=(uint32_t)(rt_tick_get()-before); /* This target uses 1000Hz ticks. */
++      if(elapsed>cam_net_counters.queue_wait_max_ms)cam_net_counters.queue_wait_max_ms=elapsed;
++      if(elapsed>10)++cam_net_counters.queue_slow;
++      if(ret==kNoErr)++cam_net_counters.enqueued;else ++cam_net_counters.queue_fail;
++    }
+     if(kNoErr != ret)
+     {
+         APP_PRT("bmsg_tx_sender failed\r\n");
+@@ -913,56 +922,14 @@ void user_main_entry(void){
+ }
+ 
+ 
+-static struct dfs_fd fd;
+-void run_init_script(void){
+-
+-    char cmd[32];
+-    memset(cmd, 0, sizeof(cmd));
+-    
+-    char buf;
+-    uint8_t i = 0;
+-
+-    int length;
+-
+-    os_printf("Running init script: /sd/init.msh\r\n");
+-
+-    if (dfs_file_open(&fd, "/sd/init.msh", O_RDONLY) < 0){
+-        os_printf("Init file open failed\r\n");
+-    }
+-
+-    do {
+-        
+-        length = dfs_file_read(&fd, &buf, 1 );
+-        if (length > 0){
+-            if(buf != '\n' && buf != '\r'){
+-                //rt_kprintf("%c", buf);
+-                cmd[i] = buf;
+-                i++;
+-
+-            }else{
+-                os_printf("\r\n ## Running command: %s\r\n", cmd);
+-                msh_exec(cmd, i);
+-                memset(cmd, 0, sizeof(cmd));
+-                i = 0;
+-            }
+-            
+-        }
+-    }while (length > 0);
+-
+-    dfs_file_close(&fd);
+-
+-    os_printf("Init script done.\r\n");
+-
+-}
+-
+-
+ void app_start(void){
+ 
+     app_pre_start();
+     fancy_msg();
+ 
+     delay100us(5*10000);
+-    run_init_script();
++    extern void cam_auto_boot(void);
++    cam_auto_boot();
+     
+     
+                                                                                                                                         
+diff --git a/beken378/app/config/sys_config_bk7251.h b/beken378/app/config/sys_config_bk7251.h
+index 0e5f1e9..e89681e 100644
+--- a/beken378/app/config/sys_config_bk7251.h
++++ b/beken378/app/config/sys_config_bk7251.h
+@@ -201,9 +201,9 @@
+ 
+ /*section 25 ----- use audio*/
+ #if (CFG_SOC_NAME == SOC_BK7221U)
+-#define CFG_USE_AUDIO                              1
+-#define CFG_USE_AUD_DAC                            1
+-#define CFG_USE_AUD_ADC                            1
++#define CFG_USE_AUDIO                              0
++#define CFG_USE_AUD_DAC                            0
++#define CFG_USE_AUD_ADC                            0
+ #else
+ #define CFG_USE_AUDIO                              0
+ #define CFG_USE_AUD_DAC                            0
+diff --git a/beken378/app/video_work/video_buffer.c b/beken378/app/video_work/video_buffer.c
+index 1c1d5ee..cf42a10 100644
+--- a/beken378/app/video_work/video_buffer.c
++++ b/beken378/app/video_work/video_buffer.c
+@@ -1,10 +1,17 @@
++#ifdef CAM_VIDEO_BUFFER_HOST
++#include "video_buffer_host.h"
++#else
+ #include "include.h"
++#endif
+ 
+ #if (CFG_USE_APP_DEMO_VIDEO_TRANSFER)
++#ifndef CAM_VIDEO_BUFFER_HOST
+ #include "video_transfer_config.h"
++#endif
+ 
+ // this moudule only support camera in chip, with sccb interface.
+ #if ((CFG_USE_CAMERA_INTF) && (APP_DEMO_CFG_USE_VIDEO_BUFFER))
++#ifndef CAM_VIDEO_BUFFER_HOST
+ //#include "FreeRTOS.h"
+ //#include "task.h"
+ #include "rtos_pub.h"
+@@ -20,6 +27,8 @@
+ #include "general_dma_pub.h"
+ #endif
+ 
++#endif
++
+ typedef struct vbuf_hdr_st
+ {
+     UINT8 id;
+@@ -31,6 +40,7 @@ typedef struct vbuf_hdr_st
+ #define BUF_STA_DONE        0
+ #define BUF_STA_COPY        1
+ #define BUF_STA_FULL        2
++#define BUF_STA_WAIT        3
+ 
+ typedef struct video_buffer_st
+ {
+@@ -49,6 +59,24 @@ typedef struct video_buffer_st
+ 
+ VBUF_PTR g_vbuf = NULL;
+ static UINT32 g_pkt_seq = 0;
++static VIDEO_BUFFER_STATS_ST vbuf_stats;
++
++void video_buffer_get_stats(VIDEO_BUFFER_STATS_ST *stats)
++{
++    GLOBAL_INT_DECLARATION();
++    if (!stats) return;
++    GLOBAL_INT_DISABLE();
++    *stats = vbuf_stats;
++    GLOBAL_INT_RESTORE();
++}
++
++/* A dropped frame is terminal for this read. Wake immediately, rather than
++ * leaving the consumer blocked for its whole timeout. */
++static void video_buffer_drop(void)
++{
++    g_vbuf->start_buf = BUF_STA_FULL;
++    rtos_set_semaphore(&g_vbuf->aready_semaphore);
++}
+ 
+ static void video_buffer_add_pkt_header(TV_HDR_PARAM_PTR param)
+ {
+@@ -86,9 +114,13 @@ static int video_buffer_recv_video_data(UINT8 *data, UINT32 len)
+         org_len = len - sizeof(VB_HDR_ST);
+         data = data + sizeof(VB_HDR_ST);
+ 
+-        if ((hdr->id != g_vbuf->frame_id) && (hdr->pkt_seq == 1))
++        if ((g_vbuf->start_buf == BUF_STA_WAIT || g_vbuf->start_buf == BUF_STA_COPY)
++            && (hdr->id != g_vbuf->frame_id) && (hdr->pkt_seq == 1))
+         {
+             // start of frame;
++            if (g_vbuf->start_buf == BUF_STA_COPY && g_vbuf->frame_len)
++                ++vbuf_stats.gaps;
++            ++vbuf_stats.started;
+             GLOBAL_INT_DISABLE();
+             g_vbuf->frame_id = hdr->id;
+             g_vbuf->frame_len = 0;
+@@ -99,6 +131,15 @@ static int video_buffer_recv_video_data(UINT8 *data, UINT32 len)
+             //os_printf("sof:%d\r\n", g_vbuf->frame_id);
+         }
+ 
++        if (g_vbuf->start_buf == BUF_STA_COPY &&
++            hdr->id == g_vbuf->frame_id &&
++            hdr->pkt_seq != g_vbuf->frame_pkt_cnt + 1)
++        {
++            ++vbuf_stats.gaps;
++            video_buffer_drop();
++            return len;
++        }
++
+         //os_printf("%d-%d: %d-%d: %d\r\n", hdr->id, g_vbuf->frame_id,
+         //    hdr->pkt_seq, (g_vbuf->frame_pkt_cnt + 1), g_vbuf->start_buf);
+ 
+@@ -126,6 +167,11 @@ static int video_buffer_recv_video_data(UINT8 *data, UINT32 len)
+                     UINT8 *sof_ptr, *eof_ptr, *crc_ptr;
+                     UINT32 p_len, right_image = 0;
+ 
++                    if (g_vbuf->frame_len < 7) {
++                        ++vbuf_stats.invalid;
++                        video_buffer_drop();
++                        return len;
++                    }
+                     sof_ptr = g_vbuf->buf_base;
+                     eof_ptr = g_vbuf->buf_base + (g_vbuf->frame_len - 7);
+                     crc_ptr = eof_ptr + 3;
+@@ -143,8 +189,11 @@ static int video_buffer_recv_video_data(UINT8 *data, UINT32 len)
+                         }
+                     }
+ 
++                    if (g_vbuf->frame_len > vbuf_stats.max_frame_len)
++                        vbuf_stats.max_frame_len = g_vbuf->frame_len;
+                     if (right_image)
+                     {
++                        ++vbuf_stats.valid;
+                         //os_printf("set ph\r\n");
+                         GLOBAL_INT_DISABLE();
+                         g_vbuf->start_buf = BUF_STA_DONE;
+@@ -153,15 +202,21 @@ static int video_buffer_recv_video_data(UINT8 *data, UINT32 len)
+                         // all frame data have received, wakeup usr thread
+                         rtos_set_semaphore(&g_vbuf->aready_semaphore);
+                     }
++                    else
++                    {
++                        ++vbuf_stats.invalid;
++                        video_buffer_drop();
++                    }
+ 
+                 }
+             }
+             else
+             {
+-                os_printf("vbuf full!\r\n");
+-                GLOBAL_INT_DISABLE();
+-                g_vbuf->start_buf = BUF_STA_FULL;
+-                GLOBAL_INT_RESTORE();
++                ++vbuf_stats.overflows;
++                os_printf("vbuf full! size>%u capacity=%u\r\n",
++                          (unsigned)(g_vbuf->frame_len + org_len),
++                          (unsigned)g_vbuf->buf_len);
++                video_buffer_drop();
+ 
+             }
+         }
+@@ -274,6 +329,11 @@ int video_buffer_close(void)
+ }
+ 
+ UINT32 video_buffer_read_frame(UINT8 *buf, UINT32 buf_len)
++{
++    return video_buffer_read_frame_timeout(buf, buf_len, BEKEN_WAIT_FOREVER);
++}
++
++UINT32 video_buffer_read_frame_timeout(UINT8 *buf, UINT32 buf_len, UINT32 timeout_ms)
+ {
+     UINT32 frame_len = 0;
+     GLOBAL_INT_DECLARATION();
+@@ -292,25 +352,37 @@ UINT32 video_buffer_read_frame(UINT8 *buf, UINT32 buf_len)
+         while (rtos_get_semaphore(&g_vbuf->aready_semaphore, 0) == kNoErr);
+ 
+         GLOBAL_INT_DISABLE();
++        /* A previous bounded read may have ended midway through a frame.
++         * Ignore its remaining packets and wait for a new SOF. In particular,
++         * never retain buf_ptr into a slot now owned by the RTSP sender. */
++        g_vbuf->start_buf = BUF_STA_WAIT;
++        g_vbuf->frame_id = 0xffff;
++        g_vbuf->frame_pkt_cnt = 0;
++        g_vbuf->frame_len = 0;
++        g_vbuf->buf_ptr = NULL;
+         g_vbuf->buf_base = buf;
+         g_vbuf->buf_len = buf_len;
+         GLOBAL_INT_RESTORE();
+ 
+-        timeout = BEKEN_WAIT_FOREVER;
++        timeout = timeout_ms;
+ 
+         ret = rtos_get_semaphore(&g_vbuf->aready_semaphore, timeout);
+-        if (ret == kNoErr)
++        if (ret == kNoErr && g_vbuf->start_buf == BUF_STA_DONE)
+         {
+             frame_len = g_vbuf->frame_len;
+         }
+-        else
++        else if (ret != kNoErr)
+         {
+-            os_printf("read frame time out\r\n");
++            ++vbuf_stats.timeouts;
++            if (timeout_ms == BEKEN_WAIT_FOREVER)
++                os_printf("read frame time out\r\n");
+         }
+ 
+         GLOBAL_INT_DISABLE();
+         g_vbuf->buf_base = NULL;
+         g_vbuf->buf_len = 0;
++        g_vbuf->buf_ptr = NULL;
++        g_vbuf->start_buf = BUF_STA_DONE;
+         GLOBAL_INT_RESTORE();
+     }
+ 
+@@ -386,4 +458,3 @@ void video_buffer_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, char *
+ 
+ #endif // ((CFG_USE_CAMERA_INTF) && (APP_DEMO_CFG_USE_VIDEO_BUFFER))
+ #endif //#if (CFG_USE_APP_DEMO_VIDEO_TRANSFER)
+-
+diff --git a/beken378/driver/i2c/i2c2.c b/beken378/driver/i2c/i2c2.c
+index 495c563..bccd4b9 100644
+--- a/beken378/driver/i2c/i2c2.c
++++ b/beken378/driver/i2c/i2c2.c
+@@ -815,11 +815,9 @@ static UINT32 i2c2_open(UINT32 op_flag)
+     REG_WRITE(REG_I2C2_CONFIG, reg);
+     REG_WRITE(REG_I2C2_STA, reg1);
+     
+-    if(op_flag) {
+-        i2c2_set_freq_div(op_flag);
+-    } else {
+-        i2c2_set_freq_div(I2C_CLK_DIVID(I2C_DEFAULT_BAUD));
+-    }
++    /* op_flag contains transaction mode bits, not a clock divider.
++     * Use a conservative bus speed for the HB6 HI704 bring-up. */
++    i2c2_set_freq_div(I2C_CLK_DIVID(I2C_BAUD_100KHZ));
+ 
+     i2c2_set_idle_cr(0x3);
+     i2c2_set_scl_cr(0x4);
+@@ -1010,4 +1008,3 @@ static UINT32 i2c2_ctrl(UINT32 cmd, void *param)
+  }
+ 
+ 
+-
+diff --git a/beken378/driver/jpeg/jpeg_encoder.c b/beken378/driver/jpeg/jpeg_encoder.c
+index 4afa0b8..4609e2a 100644
+--- a/beken378/driver/jpeg/jpeg_encoder.c
++++ b/beken378/driver/jpeg/jpeg_encoder.c
+@@ -18,8 +18,8 @@
+ #define JPEG_BITRATE_MAX_SIZE_320_240           (20 * 1024)
+ #define JPEG_BITRATE_MIN_SIZE_320_240           (5 * 1024)
+ 
+-#define JPEG_BITRATE_MAX_SIZE_640_480           (25 * 1024)
+-#define JPEG_BITRATE_MIN_SIZE_640_480           (20 * 1024)
++#define JPEG_BITRATE_MAX_SIZE_640_480           (40 * 1024)
++#define JPEG_BITRATE_MIN_SIZE_640_480           (30 * 1024)
+ 
+ #define JPEG_BITRATE_MAX_SIZE_1280_720          (50 * 1024)
+ #define JPEG_BITRATE_MIN_SIZE_1280_720          (30 * 1024)
+diff --git a/beken378/driver/sys_ctrl/sys_ctrl.c b/beken378/driver/sys_ctrl/sys_ctrl.c
+index 636de14..0b2131b 100644
+--- a/beken378/driver/sys_ctrl/sys_ctrl.c
++++ b/beken378/driver/sys_ctrl/sys_ctrl.c
+@@ -976,7 +976,9 @@ UINT8 sctrl_if_mcu_can_sleep(void)
+ {
+     return (((! bk_wlan_has_role(VIF_STA))
+         || power_save_if_rf_sleep())
++#if CFG_SUPPORT_BLE
+     	&& if_ble_sleep()
++#endif
+     	&& ap_if_ap_rf_sleep()
+     	&& sctrl_if_rf_sleep()
+         && (sctrl_mcu_ps_info.hw_sleep == 0));
+diff --git a/beken378/func/camera_intf/camera_intf.c b/beken378/func/camera_intf/camera_intf.c
+index def2eeb..b25bee7 100644
+--- a/beken378/func/camera_intf/camera_intf.c
++++ b/beken378/func/camera_intf/camera_intf.c
+@@ -1,5 +1,6 @@
+ #include "include.h"
+ #include "arm_arch.h"
++#include <rtthread.h>
+ 
+ #if CFG_USE_CAMERA_INTF
+ //#include "process.h"
+@@ -389,8 +390,17 @@ camera_sensor_t* camera_detect(){
+     i2c_hdl = ddev_open(I2C2_DEV_NAME, &status, i2c2_trans_mode);
+     
+     os_printf("Searching for camera sensors, using I2C2 bus...\r\n");
++    /* Give the sensor time to respond after enabling its external clock. */
++    rt_thread_delay(RT_TICK_PER_SECOND / 20 + 1);
+ 
+     camera_sensor_t* sensor = malloc(sizeof(camera_sensor_t));
++    if (!sensor) {
++        ddev_close(ejpeg_hdl);
++        ddev_close(i2c_hdl);
++        ejpeg_hdl = i2c_hdl = DD_HANDLE_UNVALID;
++        os_printf("Unable to allocate camera descriptor.\r\n");
++        return NULLPTR;
++    }
+ 
+ 
+     if(gc0328c_sensor_detect()){
+@@ -412,6 +422,10 @@ camera_sensor_t* camera_detect(){
+         /*sensor->name = rt_strdup("None");
+         sensor->init = hi704_sensor_init;*/
+         os_printf("No compatible sensor found!\r\n");
++        free(sensor);
++        ddev_close(ejpeg_hdl);
++        ddev_close(i2c_hdl);
++        ejpeg_hdl = i2c_hdl = DD_HANDLE_UNVALID;
+         return NULLPTR;
+     }
+     
+diff --git a/beken378/func/camera_intf/sensors/hi704.c b/beken378/func/camera_intf/sensors/hi704.c
+index 14b28f8..b0e0ef0 100644
+--- a/beken378/func/camera_intf/sensors/hi704.c
++++ b/beken378/func/camera_intf/sensors/hi704.c
+@@ -1,3 +1,6 @@
++#ifdef CAM_HI704_HOST
++#include "hi704_host.h"
++#else
+ #include "include.h"
+ #include "arm_arch.h"
+ #include "drv_model_pub.h"
+@@ -8,16 +11,60 @@
+ #include "camera_intf_pub.h"
+ 
+ #include "hi704.h"
++#include <finsh.h>
++#include <string.h>
++#endif
++
++/* Reference Rockchip HI704 driver labels P20:88..8A=02BF20 as
++ * 50Hz ExpMax8fps. Half that exposure budget is our reversible fast profile;
++ * it does not force fixed frame timing or change clock/blanking. */
++#define HI704_STOCK_EXPOSURE 0x02bf20u
++#define HI704_FAST_EXPOSURE  0x015f90u
++static UINT32 hi704_exposure=HI704_FAST_EXPOSURE;
++static int hi704_initialized,hi704_profile_verified;
++static int hi704_set_exposure(UINT32 value) {
++    UINT8 page=0x20,ae=0x1c,readback[3]={0};unsigned i;int failed=0;
++    hi704_profile_verified=0;
++    failed|=camera_intf_sccb_write2(HI704_DEV_ID,0x03,&page,1);
++    failed|=camera_intf_sccb_write2(HI704_DEV_ID,0x10,&ae,1);
++    for(i=0;i<3;++i) {
++        UINT8 byte=(UINT8)(value>>(16-8*i));
++        failed|=camera_intf_sccb_write2(HI704_DEV_ID,0x88+i,&byte,1);
++        failed|=camera_intf_sccb_read2(HI704_DEV_ID,0x88+i,&readback[i],1);
++        if(readback[i]!=byte)failed=1;
++    }
++    ae=0x9c;failed|=camera_intf_sccb_write2(HI704_DEV_ID,0x10,&ae,1);
++    page=0;failed|=camera_intf_sccb_write2(HI704_DEV_ID,0x03,&page,1);
++    if(!failed){hi704_exposure=value;hi704_profile_verified=1;}
++    os_printf("HI704 exposure max=%02x%02x%02x verify=%s\r\n",readback[0],readback[1],readback[2],failed?"FAILED":"OK");
++    return failed?-1:0;
++}
++static int hi704_fps(int argc,char **argv) {
++    UINT32 value;
++    if(argc!=2){rt_kprintf("hi704_fps fast|stock|status\n");return -1;}
++    if(!strcmp(argv[1],"status")){rt_kprintf("HI704 initialized=%d verified=%d exposure_limit=%u profile=%s\n",hi704_initialized,hi704_profile_verified,(unsigned)hi704_exposure,hi704_exposure==HI704_FAST_EXPOSURE?"fast":"stock");return 0;}
++    if(!strcmp(argv[1],"fast"))value=HI704_FAST_EXPOSURE;
++    else if(!strcmp(argv[1],"stock"))value=HI704_STOCK_EXPOSURE;
++    else return -1;
++    if(!hi704_initialized){hi704_exposure=value;return 0;}
++    { UINT32 previous=hi704_exposure;
++      if(!hi704_set_exposure(value))return 0;
++      hi704_set_exposure(previous);return -1;
++    }
++}
++MSH_CMD_EXPORT(hi704_fps, HI704 exposure profile with stock rollback);
+ 
+ uint8_t hi704_sensor_detect(void){
+-    uint8_t data;
++    uint8_t data = 0xff, repeated = 0xff;
+     uint8_t addr = 0x04;
+ 
+-    camera_intf_sccb_read2(HI704_DEV_ID, addr, &data, 1);
++    uint8_t status = camera_intf_sccb_read2(HI704_DEV_ID, addr, &data, 1);
++    uint8_t status2 = camera_intf_sccb_read2(HI704_DEV_ID, addr, &repeated, 1);
+ 
+-    os_printf("%x", data);
++    os_printf("HI704 I2C2 addr=0x30 reg=0x04: %02x/%02x status=%u/%u\r\n",
++              data, repeated, status, status2);
+ 
+-    uint8_t found = (data == HI704_DEV_CHIPID);
++    uint8_t found = (!status && !status2 && data == HI704_DEV_CHIPID && repeated == data);
+ 
+     if(found){
+         os_printf("Found sensor HI704!");
+@@ -49,7 +96,12 @@ void hi704_sensor_init(DD_HANDLE i2c_hdl, DD_HANDLE ejpeg_hdl, camera_sensor_t *
+     //hi704_camera_inf_cfg_ppi(CMPARAM_GET_PPI(sensor->ejpeg_cfg->sener_cfg));
+     //hi704_camera_inf_cfg_fps(CMPARAM_GET_FPS(sensor->ejpeg_cfg->sener_cfg));
+ 
++    hi704_initialized=1;
++    if(hi704_set_exposure(hi704_exposure)) {
++        os_printf("HI704: restoring stock exposure after failed verification\r\n");
++        hi704_set_exposure(HI704_STOCK_EXPOSURE);
++    }
+     os_printf("HI704 initialization finished.\r\n");
+ 
+ 
+-}
+\ No newline at end of file
++}
+diff --git a/beken378/func/rwnx_intf/rw_msdu.c b/beken378/func/rwnx_intf/rw_msdu.c
+index 2946fac..211dd02 100644
+--- a/beken378/func/rwnx_intf/rw_msdu.c
++++ b/beken378/func/rwnx_intf/rw_msdu.c
+@@ -1,3 +1,4 @@
++#include "cam_net_diag.h"
+ #include "include.h"
+ #include "doubly_list.h"
+ #include "rw_msdu.h"
+@@ -615,6 +616,7 @@ UINT32 rwm_transfer(UINT8 vif_idx, UINT8 *buf, UINT32 len, int sync, void *args)
+         txl_cntrl_dec_pck_cnt();
+         #endif
+ 
++        ++cam_net_counters.node_fail;
+         os_printf("rwm_transfer no node\r\n");
+         goto tx_exit;
+     }
+@@ -749,6 +751,7 @@ UINT32 rwm_transfer_node(MSDU_NODE_T *node, u8 flag)
+     txdesc_new = tx_txdesc_prepare(queue_idx);
+     if(TXDESC_STA_USED == txdesc_new->status)
+     {
++        ++cam_net_counters.descriptor_fail;
+         os_printf("rwm_transfer no txdesc \r\n");
+         goto tx_exit;
+     }
+diff --git a/beken378/func/video_transfer/video_transfer.c b/beken378/func/video_transfer/video_transfer.c
+index d87e1f4..010779a 100644
+--- a/beken378/func/video_transfer/video_transfer.c
++++ b/beken378/func/video_transfer/video_transfer.c
+@@ -1,3 +1,5 @@
++#include "cam_net_diag.h"
++#include <rtthread.h>
+ #include "include.h"
+ #include "arm_arch.h"
+ 
+@@ -90,6 +92,15 @@ typedef struct tvideo_pool_st
+ } TVIDEO_POOL_ST, *TVIDEO_POOL_PTR;
+ 
+ TVIDEO_POOL_ST tvideo_pool;
++static VIDEO_TRANSFER_STATS_ST tvideo_stats;
++void video_transfer_get_stats(VIDEO_TRANSFER_STATS_ST *stats)
++{
++    GLOBAL_INT_DECLARATION();
++    if (!stats) return;
++    GLOBAL_INT_DISABLE();
++    *stats = tvideo_stats;
++    GLOBAL_INT_RESTORE();
++}
+ 
+ enum
+ {
+@@ -118,6 +129,7 @@ void tvideo_intfer_send_msg(UINT32 new_msg)
+         ret = rtos_push_to_queue(&tvideo_msg_que, &msg, BEKEN_NO_WAIT);
+         if (kNoErr != ret)
+         {
++            ++tvideo_stats.queue_drops;
+             TVIDEO_FATAL("tvideo_intfer_send_msg failed\r\n");
+         }
+     }
+@@ -266,6 +278,7 @@ static void tvideo_rx_handler(void *curptr, UINT32 newlen, UINT32 is_eof, UINT32
+         }
+         else
+         {
++            ++tvideo_stats.node_drops;
+             #if TVIDEO_DROP_DATA_NONODE
+             // not node for receive pkt, drop aready received, and also drop
+             // the new come.
+@@ -288,6 +301,14 @@ static void tvideo_rx_handler(void *curptr, UINT32 newlen, UINT32 is_eof, UINT32
+ 
+ static void tvideo_end_frame_handler(void)
+ {
++    static uint32_t previous;uint32_t now=rt_tick_get(),period=now-previous;
++    if(previous) {
++        cam_net_counters.jpeg_period_last_ms=period;
++        if(period>cam_net_counters.jpeg_period_max_ms)cam_net_counters.jpeg_period_max_ms=period;
++        if(period>150)++cam_net_counters.jpeg_long_periods;
++    }
++    previous=now;
++    ++tvideo_stats.frames;
+     #if TVIDEO_DROP_DATA_NONODE
+     // reset drop flag, new pkt can receive
+     tvideo_pool.drop_pkt_flag &= (~TVIDEO_DROP_DATA_FLAG);
+diff --git a/beken378/func/video_transfer/video_transfer.h b/beken378/func/video_transfer/video_transfer.h
+index 87caf29..a4d15c9 100644
+--- a/beken378/func/video_transfer/video_transfer.h
++++ b/beken378/func/video_transfer/video_transfer.h
+@@ -85,14 +85,23 @@ typedef struct tvideo_setup_desc
+ } TVIDEO_SETUP_DESC_ST, *TVIDEO_SETUP_DESC_PTR;
+ 
+ #if (CFG_USE_SPIDMA || CFG_USE_CAMERA_INTF)
++typedef struct video_transfer_stats_st {
++    UINT32 frames, node_drops, queue_drops;
++} VIDEO_TRANSFER_STATS_ST;
++void video_transfer_get_stats(VIDEO_TRANSFER_STATS_ST *stats);
+ void tvideo_intfer_send_msg(UINT32 new_msg);
+ int video_transfer_init(TVIDEO_SETUP_DESC_PTR setup_cfg);
+ int video_transfer_deinit(void);
+ UINT32 video_transfer_set_video_param(UINT32 ppi, UINT32 fps);
+ 
++typedef struct video_buffer_stats_st {
++    UINT32 started, valid, overflows, invalid, gaps, timeouts, max_frame_len;
++} VIDEO_BUFFER_STATS_ST;
++void video_buffer_get_stats(VIDEO_BUFFER_STATS_ST *stats);
+ int video_buffer_open(void);
+ int video_buffer_close(void);
+ UINT32 video_buffer_read_frame(UINT8 *buf, UINT32 buf_len);
++UINT32 video_buffer_read_frame_timeout(UINT8 *buf, UINT32 buf_len, UINT32 timeout_ms);
+ #endif
+ 
+ #endif // __VIDEO_TRANS_H__
+diff --git a/config/cam_net_diag.h b/config/cam_net_diag.h
+new file mode 100644
+index 0000000..ba5d490
+--- /dev/null
++++ b/config/cam_net_diag.h
+@@ -0,0 +1,10 @@
++#ifndef CAM_NET_DIAG_H
++#define CAM_NET_DIAG_H
++#include <stdint.h>
++struct cam_net_counters {
++    uint32_t enqueued,queue_fail,queue_slow,queue_wait_max_ms;
++    uint32_t coalesce_fail,node_fail,descriptor_fail,rtsp_rto,rtsp_fast_rexmit;
++    uint32_t jpeg_period_last_ms,jpeg_period_max_ms,jpeg_long_periods;
++};
++extern volatile struct cam_net_counters cam_net_counters;
++#endif
+diff --git a/config/rtconfig/rtconfig_bk7251.h b/config/rtconfig/rtconfig_bk7251.h
+index e5cfde3..d2260b4 100644
+--- a/config/rtconfig/rtconfig_bk7251.h
++++ b/config/rtconfig/rtconfig_bk7251.h
+@@ -106,9 +106,10 @@
+ #define RT_USING_WLAN_AP
+ #define WIFI_DEVICE_STA_NAME "w0"
+ #define WIFI_DEVICE_AP_NAME "ap"
+-#define RT_USING_AUDIO
++/* Camera profile: audio disabled. */
++//#define RT_USING_AUDIO
+ #define RT_USING_SPI
+-#define RT_USING_I2S
++//#define RT_USING_I2S
+ 
+ /* Using USB */
+ 
+diff --git a/drivers/wlan/drv_wlan.c b/drivers/wlan/drv_wlan.c
+index 2d00f0a..32fa5a6 100644
+--- a/drivers/wlan/drv_wlan.c
++++ b/drivers/wlan/drv_wlan.c
+@@ -556,127 +556,126 @@ out:
+ 	return ret;
+ #endif /* CFG_WPA_CTRL_IFACE */
+ }
+-
+-static rt_err_t _wifi_easyjoin(rt_device_t dev, void *passwd)
+-{
+-	network_InitTypeDef_st wNetConfig;
+-	struct rt_wlan_device *wlan = RT_NULL;
+-	const char *ssid = RT_NULL;
+-	const uint8_t *bssid = RT_NULL;
+-	int len;
+-
+-	rt_kprintf("[wifi_connect]: normal connect \n");
+-	_g_sta_info.mode = NORMAL_MODE;
+-	_g_sta_info.state = CONNECT_DOING;
+-	wlan = RT_WLAN_DEVICE(dev);
+-	ssid = wlan->info->ssid;
+-	bssid = wlan->info->bssid;
+-	rt_memset(&wNetConfig, 0x0, sizeof(network_InitTypeDef_st));
+-
+-	if ((ssid != NULL) && ('\0' != *ssid)) {
+-		len = rt_strlen(ssid);
+-		if (SSID_MAX_LEN < len) {
+-			rt_kprintf("ssid name more than 32 Bytes\r\n");
+-			return -RT_ERROR;
+-		}
+-
+-		rt_strncpy((char *)wNetConfig.wifi_ssid, ssid, sizeof(wNetConfig.wifi_ssid));
+-	}
+-#if CFG_SUPPOET_BSSID_CONNECT
+-	else if (((bssid[0] != 0xFF)
+-			  || (bssid[1] != 0xFF)
+-			  || (bssid[2] != 0xFF)
+-			  || (bssid[3] != 0xFF)
+-			  || (bssid[4] != 0xFF)
+-			  || (bssid[5] != 0xFF))
+-			 && ((bssid[0] != 0x0)
+-				 || (bssid[1] != 0x0)
+-				 || (bssid[2] != 0x0)
+-				 || (bssid[3] != 0x0)
+-				 || (bssid[4] != 0x0)
+-				 || (bssid[5] != 0x0)))
+-		rt_memcpy((void *)wNetConfig.wifi_bssid, bssid, sizeof(wNetConfig.wifi_bssid));
+-#endif
+-	else {
+-		rt_kprintf("ssid is null or bssid is invalid/disabled\r\n");
+-		return -RT_ERROR;
+-	}
+-
+-	if (passwd == NULL)
+-		rt_memset(wNetConfig.wifi_key, 0, sizeof(wNetConfig.wifi_key));
+-	else {
+-		if (sizeof(wNetConfig.wifi_key) < rt_strlen(passwd)) {
+-			rt_kprintf("wifi key is more than %d Bytes\r\n", sizeof(wNetConfig.wifi_key));
+-			return -RT_ERROR;
+-		}
+-		rt_strncpy((char *)wNetConfig.wifi_key, passwd, sizeof(wNetConfig.wifi_key));
+-	}
+-
+-	wNetConfig.wifi_mode = BK_STATION;
+-	wNetConfig.dhcp_mode = DHCP_CLIENT;
+-	wNetConfig.wifi_retry_interval = 100;
+-
+-	rt_kprintf("_wifi_easyjoin: ssid:%.*s bssid:%02x:%02x:%02x:%02x:%02x:%02x key:%.*s\r\n",
+-			   sizeof(wNetConfig.wifi_ssid), wNetConfig.wifi_ssid,
+-			   bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],
+-			   sizeof(wNetConfig.wifi_key), wNetConfig.wifi_key);
+-	bk_wlan_start(&wNetConfig);
+-
+-	return RT_EOK;
+-}
+-
+-static rt_err_t _wifi_softap(rt_device_t dev, void *passwd)
+-{
+-	network_InitTypeDef_st wNetConfig;
+-	struct rt_wlan_device *wlan = RT_NULL;
+-	const char *ssid = RT_NULL;
+-	uint16_t channel;
+-	int len;
+-
+-	wlan = RT_WLAN_DEVICE(dev);
+-	ssid = wlan->info->ssid;
+-	channel = wlan->info->channel;
+-	rt_memset(&wNetConfig, 0x0, sizeof(network_InitTypeDef_st));
+-
+-	if (ssid == NULL) {
+-		rt_kprintf("ssid is null\r\n");
+-		return -RT_ERROR;
+-	}
+-
+-	len = rt_strlen(ssid);
+-	if (SSID_MAX_LEN < len) {
+-		rt_kprintf("ssid name more than 32 Bytes\r\n");
+-		/* continue to use 32 bytes ssid, do not return err */
+-		len = SSID_MAX_LEN;
+-	}
+-	rt_strncpy((char *)wNetConfig.wifi_ssid, ssid, sizeof(wNetConfig.wifi_ssid));
+-
+-	if (passwd == NULL)
+-		rt_memset(wNetConfig.wifi_key, 0, sizeof(wNetConfig.wifi_key));
+-	else {
+-		if (sizeof(wNetConfig.wifi_key) < rt_strlen(passwd)) {
+-			rt_kprintf("wifi key is more than %d Bytes\r\n", sizeof(wNetConfig.wifi_key));
+-			return -RT_ERROR;
+-		}
+-		rt_strncpy((char *)wNetConfig.wifi_key, passwd, sizeof(wNetConfig.wifi_key));
+-	}
+-
+-	wNetConfig.wifi_mode = BK_SOFT_AP;
+-	wNetConfig.dhcp_mode = DHCP_SERVER;
+-	wNetConfig.wifi_retry_interval = 100;
+-	wNetConfig.reserved[0] = channel & 0xff;
+-	wNetConfig.reserved[1] = (channel >> 8) & 0xff;
+-
+-	os_strcpy((char *)wNetConfig.local_ip_addr, DHCPD_SERVER_IP);
+-	os_strcpy((char *)wNetConfig.net_mask, "255.255.255.0");
+-	os_strcpy((char *)wNetConfig.gateway_ip_addr, DHCPD_SERVER_IP);
+-	os_strcpy((char *)wNetConfig.dns_server_ip_addr, DHCPD_SERVER_IP);
+-
+-	rt_kprintf("_wifi_softap: ssid:%.*s key:%.*s\r\n", sizeof(wNetConfig.wifi_ssid), wNetConfig.wifi_ssid, sizeof(wNetConfig.wifi_key), wNetConfig.wifi_key);
+-	bk_wlan_start(&wNetConfig);
+-
+-	return RT_EOK;
+-}
++
++static rt_err_t _wifi_easyjoin(rt_device_t dev, void *passwd)
++{
++	network_InitTypeDef_st wNetConfig;
++	struct rt_wlan_device *wlan = RT_NULL;
++	const char *ssid = RT_NULL;
++	const uint8_t *bssid = RT_NULL;
++	int len;
++
++	rt_kprintf("[wifi_connect]: normal connect \n");
++	_g_sta_info.mode = NORMAL_MODE;
++	_g_sta_info.state = CONNECT_DOING;
++	wlan = RT_WLAN_DEVICE(dev);
++	ssid = wlan->info->ssid;
++	bssid = wlan->info->bssid;
++	rt_memset(&wNetConfig, 0x0, sizeof(network_InitTypeDef_st));
++
++	if ((ssid != NULL) && ('\0' != *ssid)) {
++		len = rt_strlen(ssid);
++		if (SSID_MAX_LEN < len) {
++			rt_kprintf("ssid name more than 32 Bytes\r\n");
++			return -RT_ERROR;
++		}
++
++		rt_strncpy((char *)wNetConfig.wifi_ssid, ssid, sizeof(wNetConfig.wifi_ssid));
++	}
++#if CFG_SUPPOET_BSSID_CONNECT
++	else if (((bssid[0] != 0xFF)
++			  || (bssid[1] != 0xFF)
++			  || (bssid[2] != 0xFF)
++			  || (bssid[3] != 0xFF)
++			  || (bssid[4] != 0xFF)
++			  || (bssid[5] != 0xFF))
++			 && ((bssid[0] != 0x0)
++				 || (bssid[1] != 0x0)
++				 || (bssid[2] != 0x0)
++				 || (bssid[3] != 0x0)
++				 || (bssid[4] != 0x0)
++				 || (bssid[5] != 0x0)))
++		rt_memcpy((void *)wNetConfig.wifi_bssid, bssid, sizeof(wNetConfig.wifi_bssid));
++#endif
++	else {
++		rt_kprintf("ssid is null or bssid is invalid/disabled\r\n");
++		return -RT_ERROR;
++	}
++
++	if (passwd == NULL)
++		rt_memset(wNetConfig.wifi_key, 0, sizeof(wNetConfig.wifi_key));
++	else {
++		if (sizeof(wNetConfig.wifi_key) < rt_strlen(passwd)) {
++			rt_kprintf("wifi key is more than %d Bytes\r\n", sizeof(wNetConfig.wifi_key));
++			return -RT_ERROR;
++		}
++		rt_strncpy((char *)wNetConfig.wifi_key, passwd, sizeof(wNetConfig.wifi_key));
++	}
++
++	wNetConfig.wifi_mode = BK_STATION;
++	wNetConfig.dhcp_mode = DHCP_CLIENT;
++	wNetConfig.wifi_retry_interval = 100;
++
++	rt_kprintf("_wifi_easyjoin: ssid:%.*s bssid:%02x:%02x:%02x:%02x:%02x:%02x key:<hidden>\r\n",
++			   sizeof(wNetConfig.wifi_ssid), wNetConfig.wifi_ssid,
++			   bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
++	bk_wlan_start(&wNetConfig);
++
++	return RT_EOK;
++}
++
++static rt_err_t _wifi_softap(rt_device_t dev, void *passwd)
++{
++	network_InitTypeDef_st wNetConfig;
++	struct rt_wlan_device *wlan = RT_NULL;
++	const char *ssid = RT_NULL;
++	uint16_t channel;
++	int len;
++
++	wlan = RT_WLAN_DEVICE(dev);
++	ssid = wlan->info->ssid;
++	channel = wlan->info->channel;
++	rt_memset(&wNetConfig, 0x0, sizeof(network_InitTypeDef_st));
++
++	if (ssid == NULL) {
++		rt_kprintf("ssid is null\r\n");
++		return -RT_ERROR;
++	}
++
++	len = rt_strlen(ssid);
++	if (SSID_MAX_LEN < len) {
++		rt_kprintf("ssid name more than 32 Bytes\r\n");
++		/* continue to use 32 bytes ssid, do not return err */
++		len = SSID_MAX_LEN;
++	}
++	rt_strncpy((char *)wNetConfig.wifi_ssid, ssid, sizeof(wNetConfig.wifi_ssid));
++
++	if (passwd == NULL)
++		rt_memset(wNetConfig.wifi_key, 0, sizeof(wNetConfig.wifi_key));
++	else {
++		if (sizeof(wNetConfig.wifi_key) < rt_strlen(passwd)) {
++			rt_kprintf("wifi key is more than %d Bytes\r\n", sizeof(wNetConfig.wifi_key));
++			return -RT_ERROR;
++		}
++		rt_strncpy((char *)wNetConfig.wifi_key, passwd, sizeof(wNetConfig.wifi_key));
++	}
++
++	wNetConfig.wifi_mode = BK_SOFT_AP;
++	wNetConfig.dhcp_mode = DHCP_SERVER;
++	wNetConfig.wifi_retry_interval = 100;
++	wNetConfig.reserved[0] = channel & 0xff;
++	wNetConfig.reserved[1] = (channel >> 8) & 0xff;
++
++	os_strcpy((char *)wNetConfig.local_ip_addr, DHCPD_SERVER_IP);
++	os_strcpy((char *)wNetConfig.net_mask, "255.255.255.0");
++	os_strcpy((char *)wNetConfig.gateway_ip_addr, DHCPD_SERVER_IP);
++	os_strcpy((char *)wNetConfig.dns_server_ip_addr, DHCPD_SERVER_IP);
++
++	rt_kprintf("_wifi_softap: ssid:%.*s key:%.*s\r\n", sizeof(wNetConfig.wifi_ssid), wNetConfig.wifi_ssid, sizeof(wNetConfig.wifi_key), wNetConfig.wifi_key);
++	bk_wlan_start(&wNetConfig);
++
++	return RT_EOK;
++}
+ 
+ static int _wifi_disconnect(rt_device_t dev)
+ {
+@@ -1040,6 +1039,14 @@ static rt_err_t beken_wlan_control(rt_device_t dev, int cmd, void *args)
+         break;
+     }
+ 
++    case WIFI_GET_RSSI:
++    {
++        LinkStatusTypeDef link={0};
++        if(!args || bk_wlan_get_link_status(&link)!=kNoErr)return -RT_EIO;
++        *(int*)args=link.wifi_strength;
++        break;
++    }
++
+     case WIFI_ENTER_POWERSAVE:
+     {
+         int level;
+diff --git a/packages/EasyFlash/port/ef_port.c b/packages/EasyFlash/port/ef_port.c
+index 046b145..930d392 100644
+--- a/packages/EasyFlash/port/ef_port.c
++++ b/packages/EasyFlash/port/ef_port.c
+@@ -123,7 +123,13 @@ EfErrCode ef_port_erase(uint32_t addr, size_t size) {
+     /* make sure the start address is a multiple of FLASH_ERASE_MIN_SIZE */
+     EF_ASSERT(addr % EF_ERASE_MIN_SIZE == 0);
+ 
+-    bk_erase(addr, size);
++    {
++        uint32_t protect = FLASH_PROTECT_ALL, unlocked = FLASH_PROTECT_NONE;
++        flash_ctrl(CMD_FLASH_GET_PROTECT, &protect);
++        if (protect != FLASH_PROTECT_NONE) flash_ctrl(CMD_FLASH_SET_PROTECT, &unlocked);
++        bk_erase(addr, size);
++        if (protect != FLASH_PROTECT_NONE) flash_ctrl(CMD_FLASH_SET_PROTECT, &protect);
++    }
+ 
+     return result;
+ }
+@@ -144,8 +150,24 @@ EfErrCode ef_port_write(uint32_t addr, const uint32_t *buf, size_t size) {
+ 
+     EF_ASSERT(size % 4 == 0);
+ 
+-    flash_write((char *)buf, (unsigned long)size, addr);
+-
++    {
++        uint32_t protect = FLASH_PROTECT_ALL, unlocked = FLASH_PROTECT_NONE;
++        flash_ctrl(CMD_FLASH_GET_PROTECT, &protect);
++        if (protect != FLASH_PROTECT_NONE) flash_ctrl(CMD_FLASH_SET_PROTECT, &unlocked);
++        flash_write((char *)buf, (unsigned long)size, addr);
++        if (protect != FLASH_PROTECT_NONE) flash_ctrl(CMD_FLASH_SET_PROTECT, &protect);
++    }
++    /* The Beken write API supplies no status: verify physical readback. */
++    {
++        uint32_t check[32]; size_t offset = 0;
++        while (offset < size) {
++            size_t count = size - offset;
++            if (count > sizeof(check)) count = sizeof(check);
++            flash_read((char *)check, (unsigned long)count, addr + offset);
++            if (rt_memcmp(check, (const char *)buf + offset, count)) return EF_WRITE_ERR;
++            offset += count;
++        }
++    }
+     return result;
+ }
+ 
+diff --git a/packages/EasyFlash/src/ef_env.c b/packages/EasyFlash/src/ef_env.c
+index 7f3e4d1..f888b34 100644
+--- a/packages/EasyFlash/src/ef_env.c
++++ b/packages/EasyFlash/src/ef_env.c
+@@ -447,9 +447,9 @@ static EfErrCode del_env(const char *key){
+     }
+     /* calculate remain ENV length */
+     remain_env_length = get_env_data_size()
+-            - (((uint32_t) del_env + del_env_length) - ((uint32_t) env_cache + ENV_PARAM_BYTE_SIZE));
++            - (((uintptr_t) del_env + del_env_length) - ((uintptr_t) env_cache + ENV_PARAM_BYTE_SIZE));
+     /* remain ENV move forward */
+-    memcpy(del_env, del_env + del_env_length, remain_env_length);
++    memmove(del_env, del_env + del_env_length, remain_env_length);
+     /* reset ENV end address */
+     set_env_end_addr(get_env_end_addr() - del_env_length);
+     /* ENV ram cache has changed */
+@@ -584,7 +584,8 @@ EfErrCode ef_load_env(void) {
+     /* read ENV end address from flash */
+     ef_port_read(get_env_system_addr() + ENV_PARAM_INDEX_END_ADDR * 4, &env_end_addr, 4);
+     /* if ENV is not initialize or flash has dirty data, set default for it */
+-    if ((env_end_addr == 0xFFFFFFFF) || (env_end_addr < env_start_addr)
++    if ((env_end_addr == 0xFFFFFFFF) || (env_end_addr < env_start_addr + ENV_PARAM_BYTE_SIZE)
++            || (env_end_addr % 4)
+             || (env_end_addr > env_start_addr + ENV_USER_SETTING_SIZE)) {
+         result = ef_env_set_default();
+     } else {
+@@ -745,7 +746,8 @@ EfErrCode ef_save_env(void) {
+     }
+     }
+ 
+-    env_cache_changed = false;
++    /* Keep dirty data after a failed write so the next save retries it. */
++    if (result == EF_NO_ERR) env_cache_changed = false;
+ 
+     return result;
+ }
+diff --git a/packages/netutils/telnet/telnet.c b/packages/netutils/telnet/telnet.c
+index 5669cd8..bba171b 100644
+--- a/packages/netutils/telnet/telnet.c
++++ b/packages/netutils/telnet/telnet.c
+@@ -24,6 +24,7 @@
+  */
+ #include <rtthread.h>
+ #include <rtdevice.h>
++#include <errno.h>
+ 
+ #ifdef PKG_NETUTILS_TELNET
+ #if defined(RT_USING_DFS_NET) || defined(SAL_USING_POSIX)
+@@ -377,12 +378,18 @@ static void telnet_thread(void* parameter)
+     {
+         rt_kprintf("telnet: waiting for connection\n");
+ 
++        addr_size = sizeof(addr);
+         /* grab new connection */
+         if ((telnet->client_fd = accept(telnet->server_fd, (struct sockaddr *) &addr, &addr_size)) == -1)
+         {
+             continue;
+         }
+ 
++        {
++            struct timeval rx = {1, 0}, tx = {2, 0};
++            setsockopt(telnet->client_fd, SOL_SOCKET, SO_RCVTIMEO, &rx, sizeof(rx));
++            setsockopt(telnet->client_fd, SOL_SOCKET, SO_SNDTIMEO, &tx, sizeof(tx));
++        }
+         rt_kprintf("telnet: new telnet client(%s:%d) connection, switch console to telnet...\n", inet_ntoa(addr.sin_addr), addr.sin_port);
+ 
+         /* process the new connection */
+@@ -430,6 +437,10 @@ static void telnet_thread(void* parameter)
+             {
+                 process_rx(telnet, recv_buf, recv_len);
+             }
++            else if (recv_len < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
++            {
++                continue;
++            }
+             else
+             {
+                 /* close connection */
+diff --git a/packages/pahomqtt/MQTTClient-RT/mqtt_client.c b/packages/pahomqtt/MQTTClient-RT/mqtt_client.c
+index 48b0a6d..dc53d78 100644
+--- a/packages/pahomqtt/MQTTClient-RT/mqtt_client.c
++++ b/packages/pahomqtt/MQTTClient-RT/mqtt_client.c
+@@ -1,5 +1,6 @@
+ #include <string.h>
+ #include <stdint.h>
++#include <errno.h>
+ 
+ #include <rtthread.h>
+ #include <rtdevice.h>
+@@ -418,11 +419,12 @@ static int send_packet(mqtt_client *c, void *buf, int length)
+   int total = 0;                  // how many bytes we've sent
+   int bytesleft = length;         // how many we have left to send
+   int rc = 0;
++  rt_tick_t started=rt_tick_get();
+ 
+ #ifdef MQTT_USING_TLS
+   if (c->tls_session) {
+     while(total < length) {
+-      rc = mbedtls_client_write(c->tls_session, &c->buf[total], bytesleft);
++      rc = mbedtls_client_write(c->tls_session, ((unsigned char *)buf)+total, bytesleft);
+       if(rc <= 0) {
+         if(rc != MBEDTLS_ERR_SSL_WANT_READ && rc != MBEDTLS_ERR_SSL_WANT_WRITE) {
+           break;
+@@ -437,7 +439,8 @@ static int send_packet(mqtt_client *c, void *buf, int length)
+ #endif
+   
+   while(total < length) {
+-    rc = send(c->sock, &c->buf[total], bytesleft, 0);
++    if((rt_tick_t)(rt_tick_get()-started)>=rt_tick_from_millisecond(c->msg_timeout*1000))return PAHO_FAILURE;
++    rc = send(c->sock, ((unsigned char *)buf)+total, bytesleft, 0);
+     if(rc <= 0) {
+       if(!(errno == EINTR || errno == EWOULDBLOCK || errno == EAGAIN)) {
+         break;
+@@ -631,6 +634,7 @@ static int mqtt_connect(mqtt_client *c)
+     struct timeval timeout;
+     
+     timeout.tv_sec = c->connect_timeout ? c->connect_timeout : 5;
++    if(c->loop_callback && timeout.tv_sec>1)timeout.tv_sec=1;
+     timeout.tv_usec = 0;
+     
+     FD_ZERO(&readset);
+@@ -729,6 +733,7 @@ static int mqtt_subscribe(mqtt_client *c, const char *topicFilter, enum QoS qos)
+     struct timeval timeout;
+     
+     timeout.tv_sec = c->msg_timeout;
++    if(c->loop_callback && timeout.tv_sec>1)timeout.tv_sec=1;
+     timeout.tv_usec = 0;
+     
+     FD_ZERO(&readset);
+@@ -1104,7 +1109,7 @@ __mqtt_start:
+       c->tick_ping = rt_tick_get();
+       c->keepalive_counter++;
+       if(c->keepalive_counter >= c->keepalive_count) {
+-        LOG_E("[%d] can't recv Ping Response");
++        LOG_E("[%d] can't recv Ping Response", rt_tick_get());
+         goto __mqtt_disconnect;
+       }
+     } else {
+@@ -1113,6 +1118,7 @@ __mqtt_start:
+         timeout.tv_sec = 1;
+       }
+     }
++    if(c->loop_callback && timeout.tv_sec>1)timeout.tv_sec=1;
+     timeout.tv_usec = 0;
+     
+     FD_ZERO(&readset);
+@@ -1130,6 +1136,7 @@ __mqtt_start:
+       if (rc_t < 0)    goto __mqtt_disconnect;
+       
+     }
++    if(c->loop_callback && c->loop_callback(c)<0)goto __mqtt_disconnect;
+     if(c->is_quit) {
+       goto __mqtt_disconnect_exit;
+     }
+@@ -1186,6 +1193,7 @@ int paho_mqtt_start(mqtt_client *client, rt_uint32_t stack_size, rt_uint8_t  pri
+   client->msg_queue = rt_mq_create(msg_name, sizeof(mqtt_message_ack), 8, RT_IPC_FLAG_FIFO);
+   if (client->msg_queue == RT_NULL) {
+     LOG_E("Create mqtt msg pool error.");
++    rt_mutex_delete(client->mqtt_lock); client->mqtt_lock = RT_NULL;
+     return PAHO_FAILURE;
+   }
+   
+@@ -1194,10 +1202,12 @@ int paho_mqtt_start(mqtt_client *client, rt_uint32_t stack_size, rt_uint8_t  pri
+   rt_snprintf(thread_name, RT_NAME_MAX, "mqttt%d", counts++);
+   tid = rt_thread_create(thread_name, paho_mqtt_thread, (void *) client,
+                          stack_size, priority, 10);   
+-  if (tid) {
+-    rt_thread_startup(tid);
++  if (!tid || rt_thread_startup(tid) != RT_EOK) {
++    if (tid) rt_thread_delete(tid);
++    rt_mq_delete(client->msg_queue); client->msg_queue = RT_NULL;
++    rt_mutex_delete(client->mqtt_lock); client->mqtt_lock = RT_NULL;
++    return PAHO_FAILURE;
+   }
+-  
+   return PAHO_SUCCESS;
+ }
+ 
+@@ -1393,7 +1403,7 @@ __unsubscribe_exit:
+ ** output parameters:   NULL
+ ** Returned value:      PAHO_SUCCESS：成功； 其它：失败
+ *********************************************************************************************************/
+-int paho_mqtt_publish(mqtt_client *client, enum QoS qos, const char *topic, void *payload, size_t length)
++static int mqtt_publish_flags(mqtt_client *client, enum QoS qos, const char *topic, void *payload, size_t length, int retain)
+ {
+   uint16_t message_id;
+   int rc = PAHO_FAILURE;
+@@ -1416,7 +1426,7 @@ int paho_mqtt_publish(mqtt_client *client, enum QoS qos, const char *topic, void
+     message_id = 0;
+   
+   mqtt_client_lock(client);
+-  len = MQTTSerialize_publish(client->buf, client->buf_size, 0, qos, 0, message_id,
++  len = MQTTSerialize_publish(client->buf, client->buf_size, 0, qos, retain, message_id,
+                               mqtt_topic, payload, length);
+   if (len <= 0) {
+     mqtt_client_unlock(client);
+@@ -1426,9 +1436,11 @@ int paho_mqtt_publish(mqtt_client *client, enum QoS qos, const char *topic, void
+   if (qos != QOS0) {
+     rt_mq_control(client->msg_queue, RT_IPC_CMD_RESET, RT_NULL);
+   }
+-  if ((rc = send_packet(client, client->buf, len)) != PAHO_SUCCESS) { // send the subscribe packet
++  if ((rc = send_packet(client, client->buf, len)) != PAHO_SUCCESS) {
++    /* A partial PUBLISH cannot be safely reused for the next message. */
++    shutdown(client->sock,SHUT_RDWR);client->isconnected=0;
+     mqtt_client_unlock(client);
+-    goto __publish_exit; // there was a problem
++    goto __publish_exit;
+   }
+   mqtt_client_unlock(client);
+   
+@@ -1448,6 +1460,11 @@ __publish_exit:
+   return rc;
+ }
+ 
++int paho_mqtt_publish(mqtt_client *client, enum QoS qos, const char *topic, void *payload, size_t length)
++{ return mqtt_publish_flags(client, qos, topic, payload, length, 0); }
++int paho_mqtt_publish_retained(mqtt_client *client, enum QoS qos, const char *topic, void *payload, size_t length)
++{ return mqtt_publish_flags(client, qos, topic, payload, length, 1); }
++
+ /*********************************************************************************************************
+ ** Function name:       paho_mqtt_is_connected
+ ** Descriptions:        判断连接mqtt服务器是否成功
+@@ -1455,6 +1472,57 @@ __publish_exit:
+ ** output parameters:   NULL
+ ** Returned value:      1: 连接成功；0：未连接
+ *********************************************************************************************************/
++/* Worker-only QoS0 streaming PUBLISH: ONE message, immutable pieces, no full copy. */
++int paho_mqtt_publish_stream(mqtt_client *c,const char *topic,size_t length,
++                            paho_payload_piece piece,void *arg,unsigned timeout_ms)
++{
++  size_t topic_len,offset=0;int header,rc=PAHO_FAILURE;
++  rt_tick_t start=rt_tick_get(),limit=rt_tick_from_millisecond(timeout_ms);
++  struct timeval old_timeout={0,0},timeout;
++  socklen_t option_size=sizeof(old_timeout);
++  if(!c || !topic || !piece || !length || !c->isconnected || !timeout_ms)return PAHO_FAILURE;
++#ifdef MQTT_USING_TLS
++  if(c->tls_session)return PAHO_FAILURE; /* this streaming API is TCP-only */
++#endif
++  topic_len=strlen(topic);
++  if(topic_len>65535 || length>268435455u-topic_len-2 || topic_len+7>c->buf_size)return PAHO_FAILURE;
++  mqtt_client_lock(c);
++  getsockopt(c->sock,SOL_SOCKET,SO_SNDTIMEO,&old_timeout,&option_size);
++  c->buf[0]=0x31; /* retained QoS0 JPEG */
++  header=1+MQTTPacket_encode(c->buf+1,(int)(2+topic_len+length));
++  c->buf[header++]=topic_len>>8;c->buf[header++]=topic_len;
++  memcpy(c->buf+header,topic,topic_len);header+=topic_len;
++  timeout.tv_sec=0;timeout.tv_usec=100000;
++  setsockopt(c->sock,SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof(timeout));
++  while(offset<(size_t)header) {
++    int n;
++    if((rt_tick_t)(rt_tick_get()-start)>=limit)goto fail;
++    n=send(c->sock,c->buf+offset,header-offset,0);
++    if(n>0)offset+=n;
++    else if(n==0 || (errno!=EINTR && errno!=EAGAIN && errno!=EWOULDBLOCK))goto fail;
++  }
++  offset=0;
++  while(offset<length) {
++    size_t size=0,sent=0;const unsigned char *data=piece(arg,offset,&size);
++    if(!data || !size || size>length-offset)goto fail;
++    while(sent<size) {
++      int n;
++      if((rt_tick_t)(rt_tick_get()-start)>=limit)goto fail;
++      n=send(c->sock,data+sent,size-sent,0);
++      if(n>0)sent+=n;
++      else if(n==0 || (errno!=EINTR && errno!=EAGAIN && errno!=EWOULDBLOCK))goto fail;
++    }
++    offset+=size;
++  }
++  rc=PAHO_SUCCESS;goto done;
++fail:
++  /* Incomplete PUBLISH must not be followed by another packet on this socket. */
++  shutdown(c->sock,SHUT_RDWR);c->isconnected=0;
++done:
++  setsockopt(c->sock,SOL_SOCKET,SO_SNDTIMEO,&old_timeout,sizeof(old_timeout));
++  mqtt_client_unlock(c);return rc;
++}
++
+ int paho_mqtt_is_connected(mqtt_client *client)
+ {
+   return client->isconnected;
+diff --git a/packages/pahomqtt/MQTTClient-RT/mqtt_client.h b/packages/pahomqtt/MQTTClient-RT/mqtt_client.h
+index d9dda24..67f6727 100644
+--- a/packages/pahomqtt/MQTTClient-RT/mqtt_client.h
++++ b/packages/pahomqtt/MQTTClient-RT/mqtt_client.h
+@@ -117,6 +117,7 @@ struct mqtt_client
+   void (*connect_callback)(mqtt_client *);
+   void (*online_callback)(mqtt_client *);
+   void (*offline_callback)(mqtt_client *);
++  int (*loop_callback)(mqtt_client *); /* optional1s worker hook; negative reconnects */
+   
+   // 以下参数是订阅主题的回调函数，需要初始化后在启动mqtt客户端应用
+   struct message_handlers
+@@ -146,6 +147,9 @@ extern int paho_mqtt_stop(mqtt_client *client);
+ extern int paho_mqtt_subscribe(mqtt_client *client, enum QoS qos, const char *topic, subscribe_cb callback);
+ extern int paho_mqtt_unsubscribe(mqtt_client *client, const char *topic);
+ extern int paho_mqtt_publish(mqtt_client *client, enum QoS qos, const char *topic, void *payload, size_t length);
++extern int paho_mqtt_publish_retained(mqtt_client *client, enum QoS qos, const char *topic, void *payload, size_t length);
++typedef const unsigned char *(*paho_payload_piece)(void *, size_t, size_t *);
++extern int paho_mqtt_publish_stream(mqtt_client *, const char *, size_t, paho_payload_piece, void *, unsigned timeout_ms);
+ extern int paho_mqtt_is_connected(mqtt_client *client);
+ extern int paho_mqtt_control(mqtt_client *client, int cmd, void *arg);
+ 
+diff --git a/rt-thread/components/drivers/wlan/wlan_cmd.h b/rt-thread/components/drivers/wlan/wlan_cmd.h
+index 3a59bcd..fb12116 100644
+--- a/rt-thread/components/drivers/wlan/wlan_cmd.h
++++ b/rt-thread/components/drivers/wlan/wlan_cmd.h
+@@ -46,6 +46,6 @@ int wifi_save_cfg(const char *filename);
+ int wifi_save_setting(void);
+ 
+ extern struct rt_wlan_info info;
+-extern int hexstr2bin(const char *hex, u8 *buf, size_t len);
++extern int hexstr2bin(const char *hex, unsigned char *buf, size_t len);
+ 
+ #endif
+diff --git a/rt-thread/components/net/lwip-2.0.2/src/core/tcp_out.c b/rt-thread/components/net/lwip-2.0.2/src/core/tcp_out.c
+index 8603555..06be2f3 100644
+--- a/rt-thread/components/net/lwip-2.0.2/src/core/tcp_out.c
++++ b/rt-thread/components/net/lwip-2.0.2/src/core/tcp_out.c
+@@ -1,3 +1,4 @@
++#include "cam_net_diag.h"
+ /**
+  * @file
+  * Transmission Control Protocol, outgoing traffic
+@@ -1474,6 +1475,7 @@ tcp_rexmit_rto_prepare(struct tcp_pcb *pcb)
+ void
+ tcp_rexmit_rto_commit(struct tcp_pcb *pcb)
+ {
++  if(pcb && pcb->local_port==8554)++cam_net_counters.rtsp_rto;
+   LWIP_ASSERT("tcp_rexmit_rto_commit: invalid pcb", pcb != NULL);
+ 
+   /* increment number of retransmissions */
+@@ -1561,6 +1563,7 @@ void
+ tcp_rexmit_fast(struct tcp_pcb *pcb)
+ {
+   if (pcb->unacked != NULL && !(pcb->flags & TF_INFR)) {
++    if(pcb->local_port==8554)++cam_net_counters.rtsp_fast_rexmit;
+     /* This is fast retransmit. Retransmit the first unacked segment. */
+     LWIP_DEBUGF(TCP_FR_DEBUG,
+                 ("tcp_receive: dupacks %"U16_F" (%"U32_F
+diff --git a/rt-thread/components/net/lwip-2.0.2/src/lwipopts.h b/rt-thread/components/net/lwip-2.0.2/src/lwipopts.h
+index b2dfe71..bcc957e 100644
+--- a/rt-thread/components/net/lwip-2.0.2/src/lwipopts.h
++++ b/rt-thread/components/net/lwip-2.0.2/src/lwipopts.h
+@@ -227,7 +227,7 @@
+ 
+ /* TCP sender buffer space (bytes). */
+ #ifdef RT_LWIP_TCP_SND_BUF
+-#define TCP_SND_BUF                 RT_LWIP_TCP_SND_BUF
++#define TCP_SND_BUF                 (5 * TCP_MSS) /* Camera streaming: bounded 7KiB TX window. */
+ #else
+ #if CFG_LWIP_MEM_POLICY == LWIP_DEFAULT_MEM_POLICY
+ #define TCP_SND_BUF                 (TCP_MSS * 10)
+@@ -243,7 +243,7 @@
+ /* TCP writable space (bytes). This must be less than or equal
+    to TCP_SND_BUF. It is the amount of space which must be
+    available in the tcp snd_buf for select to return writable */
+-#define TCP_SNDLOWAT                (TCP_SND_BUF/2)
++#define TCP_SNDLOWAT                TCP_MSS
+ #define TCP_SNDQUEUELOWAT           TCP_SND_QUEUELEN/2
+ 
+ /* TCP receive window. */
+diff --git a/test/SConscript b/test/SConscript
+index 439c904..05b1285 100644
+--- a/test/SConscript
++++ b/test/SConscript
+@@ -2,7 +2,9 @@ from building import *
+ 
+ cwd = GetCurrentDir()
+ 
+-src  = Glob('*.c')
++# Audio/recording examples are outside the camera-only build.
++audio_examples = ['mic_record.c', 'mic_dac_loop.c', 'playlist_test.c', 'record_tcp.c', 'check_sd_play_test.c', 'i2s_test.c', 'i2s_rtt_test.c']
++src = [node for node in Glob('*.c') if str(node).split('/')[-1] not in audio_examples]
+ 
+ group = DefineGroup('test', src, depend = [''])
+ 
+diff --git a/test/cam_audio_disabled.c b/test/cam_audio_disabled.c
+new file mode 100644
+index 0000000..1e130d1
+--- /dev/null
++++ b/test/cam_audio_disabled.c
+@@ -0,0 +1,16 @@
++/* The vendor UART register/debug archive references these audio APIs even
++ * in a camera-only build. Keep the ABI, reject initialization, and allocate
++ * no audio buffers or device/task. Normal UART/MSH remains available. */
++#include "include.h"
++#include <rtthread.h>
++#if !CFG_USE_AUDIO && CFG_SOC_NAME == SOC_BK7221U
++static void unavailable(void){rt_kprintf("audio disabled in camera firmware\r\n");}
++UINT32 audio_intf_init(void){unavailable();return (UINT32)-1;}
++void audio_intf_uninit(void){unavailable();}
++void audio_intf_dac_pause(void){unavailable();}
++void audio_intf_adc_pause(void){unavailable();}
++void audio_intf_dac_play(void){unavailable();}
++void audio_intf_adc_play(void){unavailable();}
++void audio_intf_dac_set_volume(void){unavailable();}
++void audio_intf_set_sample_rate(void){unavailable();}
++#endif
+diff --git a/test/cam_auto.c b/test/cam_auto.c
+new file mode 100644
+index 0000000..99cf2e8
+--- /dev/null
++++ b/test/cam_auto.c
+@@ -0,0 +1,166 @@
++/* Autonomous camera boot: optional SD provisioning, EasyFlash, DHCP, RTSP and Telnet. */
++#include <rtthread.h>
++#include <rtdevice.h>
++#include <finsh.h>
++#include <wlan_dev.h>
++#include <dfs_fs.h>
++#include <dfs_file.h>
++#include <dfs_posix.h>
++#include <easyflash.h>
++#include <lwip/tcpip.h>
++#include <lwip/priv/tcpip_priv.h>
++#include <lwip/netif.h>
++#include <lwip/dhcp.h>
++/* RT-Thread driver accessor returns the actual netif. Beken net_get_sta_handle
++ * instead returns a wrapper structure in this SDK and must not be cast. */
++extern struct netif *wlan_get_sta_netif(void);
++#include "cam_wifi_config.h"
++#include <string.h>
++#define WIFI_FILE "/sd/wifi.conf"
++#define WIFI_KEY "cam_wifi_v1"
++#define RETRY_TICKS (20u * RT_TICK_PER_SECOND)
++extern int rtsp_cam(int argc, char **argv);
++extern int cam_rtsp_active(void);
++extern void telnet_server(void);
++extern void cam_mqtt_configure(int flash_ok);
++extern void cam_mqtt_ensure(int ready, const char *ip);
++static volatile int running, stopping, has_config, link_ready;
++static char current_ip[16];
++struct ip_snapshot { struct tcpip_api_call_data call; int ready; char ip[16]; };
++static err_t snapshot_ip(struct tcpip_api_call_data *call) {
++    struct ip_snapshot *s = (struct ip_snapshot *)call;
++    struct netif *n = wlan_get_sta_netif();
++    if (n && netif_is_up(n) && netif_is_link_up(n) &&
++        !ip4_addr_isany(netif_ip4_addr(n)) && dhcp_supplied_address(n)) {
++        s->ready = 1; ip4addr_ntoa_r(netif_ip4_addr(n), s->ip, sizeof(s->ip));
++    }
++    return ERR_OK;
++}
++/* 0 missing, 1 valid, -1 malformed/unreadable. Never execute configuration as shell commands. */
++static int read_sd(struct cam_wifi_config *cfg) {
++    struct dfs_fd fd; char text[513]; int n, used = 0;
++    static int mount_attempted;
++    struct dfs_filesystem *fs = dfs_filesystem_lookup("/sd");
++    if (!fs || strcmp(fs->path, "/sd")) {
++        /* No card-detect signal is established on this board. A failed
++         * hardware probe must not run every20s during video playback.
++         * Try once per boot; mounted-card config polling remains enabled. */
++        if (!mount_attempted) {
++            mount_attempted = 1;
++            if (rt_device_find("sd0"))
++                dfs_mount("sd0", "/sd", "elm", 0, RT_NULL);
++        }
++        fs = dfs_filesystem_lookup("/sd");
++        if (!fs || strcmp(fs->path, "/sd")) return 0;
++    }
++    memset(&fd, 0, sizeof(fd));
++    if (dfs_file_open(&fd, WIFI_FILE, O_RDONLY) < 0) return 0;
++    while (used < (int)sizeof(text)) {
++        n = dfs_file_read(&fd, text + used, sizeof(text) - used);
++        if (n <= 0) break;
++        used += n;
++    }
++    dfs_file_close(&fd);
++    if (n < 0 || cam_wifi_parse(text, used, cfg)) return -1;
++    return 1;
++}
++static int join_wifi(struct cam_wifi_config *cfg) {
++    struct rt_wlan_device *dev = (struct rt_wlan_device *)rt_device_find("w0");
++    struct rt_wlan_info info; int result;
++    if (!dev) return -1;
++    memset(&info, 0, sizeof(info));
++    if (rt_wlan_init(dev, WIFI_STATION)) return -1;
++    rt_wlan_info_init(&info, WIFI_STATION,
++        cfg->password[0] ? SECURITY_WPA2_MIXED_PSK : SECURITY_OPEN, cfg->ssid);
++    if (!info.ssid) return -1;
++    result = rt_wlan_connect(dev, &info, cfg->password);
++    rt_wlan_info_deinit(&info); return result;
++}
++static void auto_thread(void *arg) {
++    struct cam_wifi_config cfg = {{0},{0}}, sd;
++    struct cam_auto_policy policy = {0};
++    uint32_t sd_at = 0; int sd_first = 1, sd_state = 0;
++    int flash_ok = easyflash_init() == EF_NO_ERR;
++    int flash_warned = 0, mqtt_configured = 0;
++    char record[CAM_WIFI_RECORD_MAX];
++    (void)arg;
++    if (flash_ok && !cam_wifi_decode(ef_get_env(WIFI_KEY), &cfg)) {
++        has_config = 1; rt_kprintf("cam_auto: Wi-Fi loaded from internal flash\n");
++    }
++    if (!flash_ok) rt_kprintf("cam_auto: internal flash settings unavailable\n");
++    if (!rt_thread_find("telnet")) telnet_server();
++    while (!stopping) {
++        uint32_t now = (uint32_t)rt_tick_get(); unsigned actions; int changed = 0;
++        struct ip_snapshot snap;
++        if (sd_first || (uint32_t)(now - sd_at) >= RETRY_TICKS) {
++            int result; sd_first = 0; sd_at = now; result = read_sd(&sd);
++            if (result < 0 && sd_state != -1)
++                rt_kprintf("cam_auto: invalid /sd/wifi.conf; keeping previous Wi-Fi\n");
++            if (result == 1) {
++                if (!has_config || strcmp(cfg.ssid, sd.ssid) || strcmp(cfg.password, sd.password)) {
++                    cfg = sd; has_config = 1; changed = 1;
++                    rt_kprintf("cam_auto: Wi-Fi updated from SD\n");
++                }
++            }
++            if (has_config && flash_ok && !cam_wifi_encode(&cfg, record)) {
++                /* Unchanged values do not cause flash writes. Retry dirty saves
++                 * even when the SD card has subsequently been removed. */
++                int error = ef_set_env(WIFI_KEY, record);
++                if (!error) error = ef_save_env();
++                if (error) {
++                    if (!flash_warned) rt_kprintf("cam_auto: Wi-Fi flash save failed; will retry\n");
++                    flash_warned = 1;
++                } else {
++                    if (changed || flash_warned) rt_kprintf("cam_auto: Wi-Fi saved in internal flash\n");
++                    flash_warned = 0;
++                }
++            }
++            sd_state = result;
++            if (!has_config && !policy.tried) {
++                rt_kprintf("cam_auto: add ssid/password to /sd/wifi.conf for first setup\n");
++                policy.tried = 1; policy.join_at = now;
++            }
++        }
++        if (!mqtt_configured) { cam_mqtt_configure(flash_ok); mqtt_configured = 1; }
++        memset(&snap, 0, sizeof(snap));
++        if (tcpip_api_call(snapshot_ip, &snap.call) != ERR_OK) snap.ready = 0;
++        if (changed) snap.ready = 0;
++        if (snap.ready && !link_ready)
++            rt_kprintf("cam_auto: Wi-Fi ready, IP %s; RTSP :8554/stream; Telnet :23\n", snap.ip);
++        if (!snap.ready && link_ready) rt_kprintf("cam_auto: Wi-Fi lost; retry in 20 seconds\n");
++        link_ready = snap.ready; memcpy(current_ip, snap.ip, sizeof(current_ip));
++        actions = cam_auto_step(&policy, now, RETRY_TICKS, has_config, changed,
++                               snap.ready, cam_rtsp_active());
++        if (actions & CAM_AUTO_JOIN) {
++            rt_kprintf("cam_auto: connecting Wi-Fi; next retry in 20 seconds\n");
++            if (join_wifi(&cfg)) rt_kprintf("cam_auto: Wi-Fi join request failed\n");
++        }
++        if (actions & CAM_AUTO_RTSP) {
++            char *cmd[] = {"rtsp_cam", "start"}; rtsp_cam(2, cmd);
++        }
++        cam_mqtt_ensure(snap.ready, snap.ip);
++        rt_thread_delay(RT_TICK_PER_SECOND);
++    }
++    running = 0;
++}
++int cam_auto(int argc, char **argv) {
++    if (argc != 2) { rt_kprintf("cam_auto start|stop|status\n"); return -1; }
++    if (!strcmp(argv[1], "status")) {
++        rt_kprintf("cam_auto: running=%d configured=%d ready=%d IP=%s RTSP=%d\n",
++            running, has_config, link_ready, current_ip, cam_rtsp_active()); return 0;
++    }
++    if (!strcmp(argv[1], "stop")) { stopping = 1; return 0; }
++    if (!strcmp(argv[1], "start")) {
++        rt_thread_t t;
++        if (running) return 0;
++        stopping = 0; has_config = link_ready = 0; current_ip[0] = 0;
++        t = rt_thread_create("camauto", auto_thread, RT_NULL, 4096, 22, 10);
++        if (!t) return -1;
++        running = 1;
++        if (rt_thread_startup(t) != RT_EOK) { running = 0; rt_thread_delete(t); return -1; }
++        return 0;
++    }
++    return -1;
++}
++void cam_auto_boot(void) { char *cmd[] = {"cam_auto", "start"}; cam_auto(2, cmd); }
++MSH_CMD_EXPORT(cam_auto, autonomous Wi-Fi RTSP and Telnet);
+diff --git a/test/cam_frame_pool.c b/test/cam_frame_pool.c
+new file mode 100644
+index 0000000..129d40f
+--- /dev/null
++++ b/test/cam_frame_pool.c
+@@ -0,0 +1,28 @@
++#include "cam_frame_pool.h"
++#include <string.h>
++void cam_pool_init(struct cam_frame_pool *p) {
++    memset(p,0,sizeof(*p)); p->writing=p->ready=p->reading=-1;
++}
++int cam_pool_reserve(struct cam_frame_pool *p) {
++    int i;
++    if(p->writing>=0)return -1;
++    for(i=0;i<CAM_FRAME_SLOTS;++i)
++        if(i!=p->ready && i!=p->reading){p->writing=i;return i;}
++    return -1;
++}
++int cam_pool_commit(struct cam_frame_pool *p,uint32_t length,uint32_t tick) {
++    int signal;
++    if(p->writing<0)return 0;
++    if(!length){p->writing=-1;return 0;}
++    signal=p->ready<0;
++    if(!signal)++p->replaced;
++    p->length[p->writing]=length;p->tick[p->writing]=tick;
++    p->ready=p->writing;p->writing=-1;++p->captured;
++    return signal;
++}
++int cam_pool_take(struct cam_frame_pool *p) {
++    int i;
++    if(p->reading>=0 || p->ready<0)return -1;
++    i=p->ready;p->reading=i;p->ready=-1;return i;
++}
++void cam_pool_release(struct cam_frame_pool *p,int i){if(p->reading==i)p->reading=-1;}
+diff --git a/test/cam_frame_pool.h b/test/cam_frame_pool.h
+new file mode 100644
+index 0000000..c097d8f
+--- /dev/null
++++ b/test/cam_frame_pool.h
+@@ -0,0 +1,16 @@
++#ifndef CAM_FRAME_POOL_H
++#define CAM_FRAME_POOL_H
++#include <stdint.h>
++#define CAM_FRAME_SLOTS 3
++/* Caller serializes metadata access. A reading slot is never reused by producer. */
++struct cam_frame_pool {
++    int writing, ready, reading;
++    uint32_t length[CAM_FRAME_SLOTS], tick[CAM_FRAME_SLOTS];
++    uint32_t captured, replaced;
++};
++void cam_pool_init(struct cam_frame_pool *p);
++int cam_pool_reserve(struct cam_frame_pool *p);
++int cam_pool_commit(struct cam_frame_pool *p, uint32_t length, uint32_t tick);
++int cam_pool_take(struct cam_frame_pool *p);
++void cam_pool_release(struct cam_frame_pool *p, int slot);
++#endif
+diff --git a/test/cam_jpeg_tables.h b/test/cam_jpeg_tables.h
+new file mode 100644
+index 0000000..24b589f
+--- /dev/null
++++ b/test/cam_jpeg_tables.h
+@@ -0,0 +1,13 @@
++/* Standard JPEG Huffman tables: RFC 2435 Appendix B / JPEG Annex K. */
++static const unsigned char cam_dht_dc_y[] = {
++0x00,0x00,0x01,0x05,0x01,0x01,0x01,0x01,0x01,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b
++};
++static const unsigned char cam_dht_ac_y[] = {
++0x10,0x00,0x02,0x01,0x03,0x03,0x02,0x04,0x03,0x05,0x05,0x04,0x04,0x00,0x00,0x01,0x7d,0x01,0x02,0x03,0x00,0x04,0x11,0x05,0x12,0x21,0x31,0x41,0x06,0x13,0x51,0x61,0x07,0x22,0x71,0x14,0x32,0x81,0x91,0xa1,0x08,0x23,0x42,0xb1,0xc1,0x15,0x52,0xd1,0xf0,0x24,0x33,0x62,0x72,0x82,0x09,0x0a,0x16,0x17,0x18,0x19,0x1a,0x25,0x26,0x27,0x28,0x29,0x2a,0x34,0x35,0x36,0x37,0x38,0x39,0x3a,0x43,0x44,0x45,0x46,0x47,0x48,0x49,0x4a,0x53,0x54,0x55,0x56,0x57,0x58,0x59,0x5a,0x63,0x64,0x65,0x66,0x67,0x68,0x69,0x6a,0x73,0x74,0x75,0x76,0x77,0x78,0x79,0x7a,0x83,0x84,0x85,0x86,0x87,0x88,0x89,0x8a,0x92,0x93,0x94,0x95,0x96,0x97,0x98,0x99,0x9a,0xa2,0xa3,0xa4,0xa5,0xa6,0xa7,0xa8,0xa9,0xaa,0xb2,0xb3,0xb4,0xb5,0xb6,0xb7,0xb8,0xb9,0xba,0xc2,0xc3,0xc4,0xc5,0xc6,0xc7,0xc8,0xc9,0xca,0xd2,0xd3,0xd4,0xd5,0xd6,0xd7,0xd8,0xd9,0xda,0xe1,0xe2,0xe3,0xe4,0xe5,0xe6,0xe7,0xe8,0xe9,0xea,0xf1,0xf2,0xf3,0xf4,0xf5,0xf6,0xf7,0xf8,0xf9,0xfa
++};
++static const unsigned char cam_dht_dc_c[] = {
++0x01,0x00,0x03,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b
++};
++static const unsigned char cam_dht_ac_c[] = {
++0x11,0x00,0x02,0x01,0x02,0x04,0x04,0x03,0x04,0x07,0x05,0x04,0x04,0x00,0x01,0x02,0x77,0x00,0x01,0x02,0x03,0x11,0x04,0x05,0x21,0x31,0x06,0x12,0x41,0x51,0x07,0x61,0x71,0x13,0x22,0x32,0x81,0x08,0x14,0x42,0x91,0xa1,0xb1,0xc1,0x09,0x23,0x33,0x52,0xf0,0x15,0x62,0x72,0xd1,0x0a,0x16,0x24,0x34,0xe1,0x25,0xf1,0x17,0x18,0x19,0x1a,0x26,0x27,0x28,0x29,0x2a,0x35,0x36,0x37,0x38,0x39,0x3a,0x43,0x44,0x45,0x46,0x47,0x48,0x49,0x4a,0x53,0x54,0x55,0x56,0x57,0x58,0x59,0x5a,0x63,0x64,0x65,0x66,0x67,0x68,0x69,0x6a,0x73,0x74,0x75,0x76,0x77,0x78,0x79,0x7a,0x82,0x83,0x84,0x85,0x86,0x87,0x88,0x89,0x8a,0x92,0x93,0x94,0x95,0x96,0x97,0x98,0x99,0x9a,0xa2,0xa3,0xa4,0xa5,0xa6,0xa7,0xa8,0xa9,0xaa,0xb2,0xb3,0xb4,0xb5,0xb6,0xb7,0xb8,0xb9,0xba,0xc2,0xc3,0xc4,0xc5,0xc6,0xc7,0xc8,0xc9,0xca,0xd2,0xd3,0xd4,0xd5,0xd6,0xd7,0xd8,0xd9,0xda,0xe2,0xe3,0xe4,0xe5,0xe6,0xe7,0xe8,0xe9,0xea,0xf2,0xf3,0xf4,0xf5,0xf6,0xf7,0xf8,0xf9,0xfa
++};
+diff --git a/test/cam_mqtt.c b/test/cam_mqtt.c
+new file mode 100644
+index 0000000..a28f1e4
+--- /dev/null
++++ b/test/cam_mqtt.c
+@@ -0,0 +1,185 @@
++/* Optional MQTT autostart, using the SDK's existing Paho worker/reconnect loop. */
++#ifdef CAM_MQTT_HOST
++#include "cam_mqtt_host.h"
++#else
++#include <rtthread.h>
++#include <rtdevice.h>
++#include <netif/ethernetif.h>
++#include <finsh.h>
++#include <dfs_file.h>
++#include <dfs_posix.h>
++#include <easyflash.h>
++#include "mqtt_client.h"
++#endif
++#include "cam_mqtt_config.h"
++#include "cam_snapshot.h"
++#include "cam_stream_info.h"
++#include <string.h>
++#include <stdio.h>
++#define MQTT_KEY "cam_mqtt_v1"
++static struct cam_mqtt_config config;
++static mqtt_client client;
++static int configured, started, attempted, initialized, save_pending, flash_available;
++static uint32_t save_at;
++static uint32_t attempt_at;
++static char uri[84], availability[84], state_topic[84], image_topic[84], camera_ip[16], device_id[32];
++static char discovery_json[2048], escaped[3][512];
++static unsigned snapshots_sent,snapshot_errors;
++static volatile int snapshot_publish_enabled=1;
++static int snapshot_enabled,snapshot_pending,discovery_pending;
++static uint32_t snapshot_at,stats_at,source_at,allocation_at;
++static int allocation_attempted;
++static unsigned source_fps_x100;
++static int json_escape(const char *in,char *out,size_t cap) {
++    static const char hex[]="0123456789abcdef";size_t used=0;
++    while(*in) {
++        unsigned char c=(unsigned char)*in++;size_t n=c<32?6:(c=='"'||c=='\\'?2:1);
++        if(used+n>=cap)return -1;
++        if(c<32){out[used++]='\\';out[used++]='u';out[used++]='0';out[used++]='0';out[used++]=hex[c>>4];out[used++]=hex[c&15];}
++        else {if(n==2)out[used++]='\\';out[used++]=c;}
++    }
++    out[used]=0;return 0;
++}
++static int discovery(mqtt_client *c) {
++    char topic[128];const char *components[]={"camera","sensor","sensor","sensor"};
++    const char *names[]={"Snapshot","IP address","RTSP URL","Source FPS"};
++    const char *keys[]={"snapshot","ip","rtsp","source_fps"};unsigned i;
++    if(json_escape(availability,escaped[0],sizeof(escaped[0])) ||
++       json_escape(state_topic,escaped[1],sizeof(escaped[1])) ||
++       json_escape(image_topic,escaped[2],sizeof(escaped[2])))return -1;
++    for(i=0;i<4;++i) {
++        int n;char entity[1024];
++        if(i==0)snprintf(entity,sizeof(entity),"\"topic\":\"%s\",\"encoding\":\"\",\"json_attributes_topic\":\"%s\"",escaped[2],escaped[1]);
++        else snprintf(entity,sizeof(entity),"\"state_topic\":\"%s\",\"value_template\":\"{{ value_json.%s }}\",\"entity_category\":\"diagnostic\"%s",escaped[1],keys[i],i==3?",\"unit_of_measurement\":\"fps\"":"");
++        /* entity is bounded separately; pathological escaping must fail cleanly. */
++        if(strlen(entity)>=sizeof(entity)-1)return -1;
++        snprintf(topic,sizeof(topic),"homeassistant/%s/%s/%s/config",components[i],device_id,keys[i]);
++        n=snprintf(discovery_json,sizeof(discovery_json),"{\"name\":\"%s\",\"unique_id\":\"%s_%s\",\"availability_topic\":\"%s\",%s,\"device\":{\"identifiers\":[\"%s\"],\"name\":\"BK7252 Camera\",\"manufacturer\":\"Beken\",\"model\":\"BK7252 HI704\",\"sw_version\":\"OpenCam14\"}}",names[i],device_id,keys[i],escaped[0],entity,device_id);
++        if(n<0 || (size_t)n>=sizeof(discovery_json) || paho_mqtt_publish_retained(c,QOS0,topic,discovery_json,n)!=PAHO_SUCCESS)return -1;
++    }
++    return 0;
++}
++static int publish_state(mqtt_client *c) {
++    char ip[16],payload[512];struct cam_stream_info info;int n;
++    rt_enter_critical();memcpy(ip,camera_ip,sizeof(ip));rt_exit_critical();cam_stream_get_info(&info);
++    n=snprintf(payload,sizeof(payload),"{\"ip\":\"%s\",\"rtsp\":\"rtsp://%s:8554/stream\",\"telnet_port\":23,\"firmware\":\"OpenCam14\",\"sensor\":\"HI704\",\"width\":640,\"height\":480,\"snapshot_interval_s\":10,\"uptime_s\":%u,\"source_fps\":%u.%02u,\"source_frames\":%u,\"captured\":%u,\"replaced\":%u,\"bad\":%u,\"snapshots_sent\":%u}",ip,ip,(unsigned)(rt_tick_get()/RT_TICK_PER_SECOND),source_fps_x100/100,source_fps_x100%100,(unsigned)info.source_frames,(unsigned)info.captured,(unsigned)info.replaced,(unsigned)info.bad,snapshots_sent);
++    return n<0 || (size_t)n>=sizeof(payload)?-1:paho_mqtt_publish_retained(c,QOS0,state_topic,payload,n);
++}
++static const unsigned char *snapshot_piece(void *arg,size_t offset,size_t *length) {
++    (void)arg;return cam_snapshot_piece(offset,length);
++}
++static int loop(mqtt_client *c) {
++    uint32_t now=(uint32_t)rt_tick_get(),tick;size_t length;
++    if(!paho_mqtt_is_connected(c))return -1;
++    if(discovery_pending){if(discovery(c))return -1;discovery_pending=0;}
++    if((uint32_t)(now-stats_at)>=10u*RT_TICK_PER_SECOND) {
++        struct cam_stream_info info;cam_stream_get_info(&info);
++        source_fps_x100=(unsigned)((uint64_t)(info.source_frames-source_at)*100*RT_TICK_PER_SECOND/(uint32_t)(now-stats_at));
++        source_at=info.source_frames;stats_at=now;if(publish_state(c))return -1;
++    }
++    if(!snapshot_enabled && (!allocation_attempted || (uint32_t)(now-allocation_at)>=20u*RT_TICK_PER_SECOND)) {
++        allocation_attempted=1;allocation_at=now;
++        if(!cam_snapshot_enable()){snapshot_enabled=1;rt_kprintf("cam_mqtt: snapshot mailbox48KiB enabled\n");}
++        else rt_kprintf("cam_mqtt: snapshot allocation failed; retry in20s\n");
++    }
++    if(!snapshot_enabled || !snapshot_publish_enabled)return 0;
++    if(!snapshot_pending && (uint32_t)(now-snapshot_at)>=9u*RT_TICK_PER_SECOND){cam_snapshot_request();snapshot_pending=1;}
++    if(!snapshot_pending || (uint32_t)(now-snapshot_at)<10u*RT_TICK_PER_SECOND || !(length=cam_snapshot_take(&tick)))return 0;
++    if((uint32_t)(now-tick)>5u*RT_TICK_PER_SECOND){cam_snapshot_release();cam_snapshot_request();return 0;}
++    {
++        int rc=paho_mqtt_publish_stream(c,image_topic,length,snapshot_piece,NULL,2000);
++        cam_snapshot_release();snapshot_pending=0;snapshot_at=(uint32_t)rt_tick_get();
++        if(rc!=PAHO_SUCCESS){++snapshot_errors;return -1;}
++        ++snapshots_sent;
++    }
++    return 0;
++}
++static int read_config(struct cam_mqtt_config *out) {
++    struct dfs_fd fd; char text[513]; int n = 0, used = 0;
++    memset(&fd, 0, sizeof(fd));
++    if (dfs_file_open(&fd, "/sd/mqtt.conf", O_RDONLY) < 0) return 0;
++    while (used < (int)sizeof(text)) {
++        n = dfs_file_read(&fd, text+used, sizeof(text)-used); if (n <= 0) break; used += n;
++    }
++    dfs_file_close(&fd);
++    return n < 0 || cam_mqtt_parse(text, used, out) ? -1 : 1;
++}
++static void save_config(void) {
++    char record[CAM_MQTT_RECORD_MAX]; int error;
++    if (!flash_available || !save_pending || cam_mqtt_encode(&config,record))return;
++    save_at=(uint32_t)rt_tick_get();
++    error=ef_set_env(MQTT_KEY,record);if(!error)error=ef_save_env();
++    if(error)rt_kprintf("cam_mqtt: flash save failed; will retry\n");
++    else {save_pending=0;rt_kprintf("cam_mqtt: settings saved in internal flash\n");}
++}
++void cam_mqtt_configure(int flash_ok) {
++    struct cam_mqtt_config sd; int r;
++    if(initialized)return;initialized=1;flash_available=flash_ok;
++    if (flash_ok && !cam_mqtt_decode(ef_get_env(MQTT_KEY), &config)) configured = 1;
++    r = read_config(&sd);
++    if (r < 0) rt_kprintf("cam_mqtt: invalid /sd/mqtt.conf; keeping saved configuration\n");
++    if (r == 1) {
++        config = sd; configured = 1;
++        save_pending=1;save_config();
++    }
++    if (!configured) rt_kprintf("cam_mqtt: add /sd/mqtt.conf to configure broker\n");
++    else if (!config.enabled) rt_kprintf("cam_mqtt: disabled by configuration\n");
++}
++static void online(mqtt_client *c) {
++    struct cam_stream_info info;uint32_t tick;size_t length;
++    rt_kprintf("cam_mqtt: connected to %s:%u\n",config.host,config.port);
++    if(paho_mqtt_publish_retained(c,QOS0,availability,"online",6)!=PAHO_SUCCESS)return;
++    cam_stream_get_info(&info);stats_at=(uint32_t)rt_tick_get();source_at=info.source_frames;
++    discovery_pending=1;snapshot_pending=0;snapshot_at=stats_at-10u*RT_TICK_PER_SECOND;
++    length=cam_snapshot_take(&tick);if(length)cam_snapshot_release();
++    publish_state(c);
++}
++static void offline(mqtt_client *c) { (void)c;rt_kprintf("cam_mqtt: disconnected; retry in 20 seconds\n"); }
++void cam_mqtt_ensure(int ready, const char *ip) {
++    MQTTPacket_connectData initial = MQTTPacket_connectData_initializer;
++    uint32_t now=(uint32_t)rt_tick_get();
++    if (save_pending && (uint32_t)(now-save_at)>=20u*RT_TICK_PER_SECOND)save_config();
++    if (!ready || !configured || !config.enabled) return;
++    rt_enter_critical(); snprintf(camera_ip,sizeof(camera_ip),"%s",ip);rt_exit_critical();
++    if (started || (attempted && (uint32_t)(now-attempt_at)<20u*RT_TICK_PER_SECOND))return;
++    attempted=1;attempt_at=now;
++    if (!device_id[0]) {
++        unsigned char mac[6]={0};rt_device_t dev=rt_device_find("w0");
++        if (!dev || rt_device_control(dev,NIOCTL_GADDR,mac)!=RT_EOK) return;
++        snprintf(device_id,sizeof(device_id),"bk7252-%02x%02x%02x%02x%02x%02x",mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
++    }
++    if(!config.client_id[0])snprintf(config.client_id,sizeof(config.client_id),"%s",device_id);
++    if (!config.topic_base[0]) snprintf(config.topic_base,sizeof(config.topic_base),"%s",config.client_id);
++    snprintf(uri,sizeof(uri),"tcp://%s:%u",config.host,config.port);
++    snprintf(availability,sizeof(availability),"%s/availability",config.topic_base);
++    snprintf(state_topic,sizeof(state_topic),"%s/state",config.topic_base);
++    snprintf(image_topic,sizeof(image_topic),"%s/snapshot",config.topic_base);
++    memset(&client,0,sizeof(client));client.sock=-1;client.uri=uri;client.condata=initial;
++    client.condata.clientID.cstring=config.client_id;
++    if(config.username[0])client.condata.username.cstring=config.username;
++    if(config.password[0])client.condata.password.cstring=config.password;
++    client.condata.cleansession=1;client.condata.keepAliveInterval=30;
++    client.condata.willFlag=1;client.condata.will.qos=0;client.condata.will.retained=1;
++    client.condata.will.topicName.cstring=availability;client.condata.will.message.cstring="offline";
++    client.online_callback=online;client.offline_callback=offline;client.loop_callback=loop;
++    client.reconnect_interval=20;client.keepalive_interval=30;client.keepalive_count=3;
++    client.connect_timeout=5;client.msg_timeout=5;
++    client.buf_size=2048;client.readbuf_size=1024;
++    client.buf=rt_calloc(1,client.buf_size);client.readbuf=rt_calloc(1,client.readbuf_size);
++    if (!client.buf || !client.readbuf || paho_mqtt_start(&client,4096,24)!=PAHO_SUCCESS) {
++        if(client.buf)rt_free(client.buf);if(client.readbuf)rt_free(client.readbuf);
++        client.buf=client.readbuf=RT_NULL;rt_kprintf("cam_mqtt: start failed; retry in 20 seconds\n");return;
++    }
++    started=1;rt_kprintf("cam_mqtt: worker started, base topic %s\n",config.topic_base);
++}
++int cam_mqtt(int argc,char **argv) {
++    if(argc==3 && !strcmp(argv[1],"snapshots")) {
++        if(!strcmp(argv[2],"on"))snapshot_publish_enabled=1;
++        else if(!strcmp(argv[2],"off"))snapshot_publish_enabled=0;
++        else return -1;
++    } else if(argc!=1){rt_kprintf("cam_mqtt [snapshots on|off]\n");return -1;}
++    rt_kprintf("cam_mqtt: configured=%d enabled=%d started=%d connected=%d broker=%s:%u base=%s\n",
++        configured,config.enabled,started,started?paho_mqtt_is_connected(&client):0,config.host,config.port,config.topic_base);
++    rt_kprintf("cam_mqtt: snapshots=%u errors=%u mailbox=%d publish_enabled=%d source_fps=%u.%02u\n",snapshots_sent,snapshot_errors,snapshot_enabled,snapshot_publish_enabled,source_fps_x100/100,source_fps_x100%100);return 0;
++}
++MSH_CMD_EXPORT(cam_mqtt, show camera MQTT status);
+diff --git a/test/cam_mqtt_config.c b/test/cam_mqtt_config.c
+new file mode 100644
+index 0000000..5c8d3e9
+--- /dev/null
++++ b/test/cam_mqtt_config.c
+@@ -0,0 +1,82 @@
++#include "cam_mqtt_config.h"
++#include <string.h>
++#include <stdio.h>
++#include <ctype.h>
++static const char hex[] = "0123456789abcdef";
++static int number(const char *p, size_t n, unsigned max, unsigned *out) {
++    size_t i; unsigned v = 0;
++    if (!n || n > 5) return -1;
++    for (i = 0; i < n; ++i) { if (p[i] < '0' || p[i] > '9') return -1; v = v*10 + p[i]-'0'; }
++    if (v > max) return -1; *out = v; return 0;
++}
++static int valid(const struct cam_mqtt_config *c) {
++    size_t i;
++    if (c->enabled > 1 || !c->port || (c->enabled && !c->host[0])) return 0;
++    for (i = 0; c->host[i]; ++i)
++        if (!isalnum((unsigned char)c->host[i]) && c->host[i] != '.' && c->host[i] != '-') return 0;
++    for (i = 0; c->client_id[i]; ++i)
++        if (!isalnum((unsigned char)c->client_id[i]) && c->client_id[i] != '_' && c->client_id[i] != '-') return 0;
++    if (strpbrk(c->topic_base, "+#\r\n") || strchr(c->username, '\r') || strchr(c->password, '\r')) return 0;
++    return !c->password[0] || c->username[0];
++}
++int cam_mqtt_parse(const char *text, size_t length, struct cam_mqtt_config *out) {
++    struct cam_mqtt_config c; const char *keys[] = {"host", "username", "password", "client_id", "topic_base"};
++    char *parts[5]; const size_t caps[] = {64,32,64,32,64}; size_t pos = 0; unsigned seen = 0;
++    memset(&c, 0, sizeof(c)); c.enabled = 1; c.port = 1883;
++    parts[0]=c.host; parts[1]=c.username; parts[2]=c.password; parts[3]=c.client_id; parts[4]=c.topic_base;
++    if (length > 512 || memchr(text, 0, length)) return -1;
++    if (length >= 3 && !memcmp(text, "\xef\xbb\xbf", 3)) pos = 3;
++    while (pos < length) {
++        size_t start = pos, end, key, n, i; const char *eq; unsigned flag, v;
++        while (pos < length && text[pos] != '\n') ++pos;
++        end = pos; if (pos < length) ++pos;
++        if (end > start && text[end-1] == '\r') --end;
++        if (end == start || text[start] == '#') continue;
++        eq = memchr(text + start, '=', end-start); if (!eq) return -1;
++        key = (size_t)(eq-text-start); n = end-(size_t)(eq-text)-1;
++        for (i = 0; i < 5; ++i) if (strlen(keys[i]) == key && !memcmp(text+start, keys[i], key)) break;
++        if (i < 5) {
++            flag = 1u << i; if (n >= caps[i] || memchr(eq+1, '\r', n)) return -1;
++            memcpy(parts[i], eq+1, n); parts[i][n] = 0;
++        } else if (key == 4 && !memcmp(text+start, "port", 4)) {
++            flag = 32; if (number(eq+1, n, 65535, &v) || !v) return -1; c.port = v;
++        } else if (key == 7 && !memcmp(text+start, "enabled", 7)) {
++            flag = 64; if (number(eq+1, n, 1, &v)) return -1; c.enabled = v;
++        } else return -1;
++        if (seen & flag) return -1; seen |= flag;
++    }
++    if (!seen || !valid(&c)) return -1; *out = c; return 0;
++}
++int cam_mqtt_encode(const struct cam_mqtt_config *c, char out[CAM_MQTT_RECORD_MAX]) {
++    const char *parts[] = {c->host,c->username,c->password,c->client_id,c->topic_base}; size_t i,j,k;
++    if (!valid(c)) return -1;
++    k = (size_t)snprintf(out, CAM_MQTT_RECORD_MAX, "01:%u:%u", c->enabled, c->port);
++    for (i = 0; i < 5; ++i) {
++        out[k++] = ':';
++        for (j = 0; parts[i][j]; ++j) {
++            unsigned char b=parts[i][j]; if (k+2 >= CAM_MQTT_RECORD_MAX) return -1;
++            out[k++]=hex[b>>4]; out[k++]=hex[b&15];
++        }
++    }
++    out[k] = 0; return 0;
++}
++static int nibble(char c) { const char *p=strchr(hex,c); return c && p ? (int)(p-hex) : -1; }
++int cam_mqtt_decode(const char *text, struct cam_mqtt_config *out) {
++    struct cam_mqtt_config c; char *parts[5]; const size_t caps[]={64,32,64,32,64};
++    size_t k=3,start,i,j; unsigned v;
++    if (!text || strlen(text) >= CAM_MQTT_RECORD_MAX || strncmp(text,"01:",3)) return -1;
++    memset(&c,0,sizeof(c)); parts[0]=c.host;parts[1]=c.username;parts[2]=c.password;parts[3]=c.client_id;parts[4]=c.topic_base;
++    start=k;while(text[k] && text[k]!=':')++k;
++    if (text[k]!=':' || number(text+start,k-start,1,&v))return -1;c.enabled=v;start=++k;
++    while(text[k] && text[k]!=':')++k;
++    if (text[k]!=':' || number(text+start,k-start,65535,&v) || !v)return -1;c.port=v;
++    for(i=0;i<5;++i) {
++        if(text[k]!=':')return -1;++k;j=0;
++        while(text[k] && text[k]!=':') {
++            int a=nibble(text[k]),b=nibble(text[k+1]);
++            if(a<0 || b<0 || j+1>=caps[i] || !(a||b))return -1;
++            parts[i][j++]=(char)((a<<4)|b);k+=2;
++        }
++    }
++    if(text[k] || !valid(&c))return -1;*out=c;return 0;
++}
+diff --git a/test/cam_mqtt_config.h b/test/cam_mqtt_config.h
+new file mode 100644
+index 0000000..4f9e82a
+--- /dev/null
++++ b/test/cam_mqtt_config.h
+@@ -0,0 +1,13 @@
++#ifndef CAM_MQTT_CONFIG_H
++#define CAM_MQTT_CONFIG_H
++#include <stddef.h>
++#include <stdint.h>
++#define CAM_MQTT_RECORD_MAX 544
++struct cam_mqtt_config {
++    char host[64], username[32], password[64], client_id[32], topic_base[64];
++    uint16_t port; unsigned char enabled;
++};
++int cam_mqtt_parse(const char *text, size_t length, struct cam_mqtt_config *out);
++int cam_mqtt_encode(const struct cam_mqtt_config *cfg, char out[CAM_MQTT_RECORD_MAX]);
++int cam_mqtt_decode(const char *record, struct cam_mqtt_config *out);
++#endif
+diff --git a/test/cam_net_diag.c b/test/cam_net_diag.c
+new file mode 100644
+index 0000000..7afb7f4
+--- /dev/null
++++ b/test/cam_net_diag.c
+@@ -0,0 +1,36 @@
++#include "include.h"
++#include <rtthread.h>
++#include <finsh.h>
++#include "wlan_ui_pub.h"
++#include "cam_net_diag.h"
++#include "lwip/tcpip.h"
++#include "lwip/priv/tcpip_priv.h"
++#include "lwip/priv/tcp_priv.h"
++extern int bk_wlan_dtim_rf_ps_get_enable_flag(void);
++volatile struct cam_net_counters cam_net_counters;
++struct tcp_snapshot {
++    struct tcpip_api_call_data call;
++    unsigned found,sndbuf,queued,cwnd,window,pending,rto_ms,retries;
++};
++static err_t inspect_tcp(struct tcpip_api_call_data *call) {
++    struct tcp_snapshot *snap=(struct tcp_snapshot*)call;struct tcp_pcb *pcb;
++    for(pcb=tcp_active_pcbs;pcb;pcb=pcb->next)if(pcb->local_port==8554 && pcb->state==ESTABLISHED) {
++        snap->found=1;snap->sndbuf=pcb->snd_buf;snap->queued=pcb->snd_queuelen;
++        snap->cwnd=pcb->cwnd;snap->window=pcb->snd_wnd;
++        snap->pending=pcb->snd_lbb-pcb->lastack;snap->rto_ms=pcb->rto*TCP_SLOW_INTERVAL;snap->retries=pcb->nrtx;break;
++    }
++    return ERR_OK;
++}
++static int cam_net(int argc,char **argv) {
++    struct cam_net_counters stats;LinkStatusTypeDef link={0};int status;struct tcp_snapshot tcp={0};
++    GLOBAL_INT_DECLARATION();(void)argc;(void)argv;
++    GLOBAL_INT_DISABLE();stats=cam_net_counters;GLOBAL_INT_RESTORE();
++    status=bk_wlan_get_link_status(&link);
++    if(tcpip_api_call(inspect_tcp,&tcp.call)!=ERR_OK)tcp.found=0;
++    rt_kprintf("NET link_status=%d rssi=%d channel=%u mcu_ps=%d rf_ps=%d\n",status,link.wifi_strength,(unsigned)link.channel,bk_wlan_mcu_ps_get_enable_flag(),bk_wlan_dtim_rf_ps_get_enable_flag());
++    rt_kprintf("NET enqueued=%u queue_fail=%u queue_slow=%u queue_wait_max_ms=%u coalesce_fail=%u node_fail=%u descriptor_fail=%u rtsp_rto=%u rtsp_fast_rexmit=%u\n",stats.enqueued,stats.queue_fail,stats.queue_slow,stats.queue_wait_max_ms,stats.coalesce_fail,stats.node_fail,stats.descriptor_fail,stats.rtsp_rto,stats.rtsp_fast_rexmit);
++    rt_kprintf("NET jpeg_period_ms=%u max_ms=%u over150ms=%u\n",stats.jpeg_period_last_ms,stats.jpeg_period_max_ms,stats.jpeg_long_periods);
++    rt_kprintf("TCP active=%u sndbuf=%u queued_segments=%u cwnd=%u peer_window=%u pending=%u rto_ms=%u retries=%u\n",tcp.found,tcp.sndbuf,tcp.queued,tcp.cwnd,tcp.window,tcp.pending,tcp.rto_ms,tcp.retries);
++    return 0;
++}
++MSH_CMD_EXPORT(cam_net, camera network counters and real RSSI);
+diff --git a/test/cam_rtp_jpeg.c b/test/cam_rtp_jpeg.c
+new file mode 100644
+index 0000000..841cd66
+--- /dev/null
++++ b/test/cam_rtp_jpeg.c
+@@ -0,0 +1,145 @@
++#include "cam_rtp_jpeg.h"
++#include <string.h>
++#include "cam_jpeg_tables.h"
++
++static unsigned be16(const uint8_t *p) { return (p[0] << 8) | p[1]; }
++static void put16(uint8_t *p, unsigned n) { p[0] = n >> 8; p[1] = n; }
++static void put32(uint8_t *p, uint32_t n) {
++    p[0] = n >> 24; p[1] = n >> 16; p[2] = n >> 8; p[3] = n;
++}
++static int default_dht(const uint8_t *p, size_t n)
++{
++    const uint8_t *table;
++    size_t size;
++    switch (*p) {
++    case 0: table = cam_dht_dc_y; size = sizeof(cam_dht_dc_y); break;
++    case 16: table = cam_dht_ac_y; size = sizeof(cam_dht_ac_y); break;
++    case 1: table = cam_dht_dc_c; size = sizeof(cam_dht_dc_c); break;
++    case 17: table = cam_dht_ac_c; size = sizeof(cam_dht_ac_c); break;
++    default: return 0;
++    }
++    return size == n && !memcmp(p, table, size);
++}
++
++/* Accept only the baseline, single-scan subset representable by RFC 2435.
++ * Do not silently turn unsupported JPEG headers into corrupt RTP frames. */
++int cam_jpeg_parse(const uint8_t *data, size_t length, struct cam_jpeg *out)
++{
++    size_t pos = 2;
++    const uint8_t *quant[4] = {0, 0, 0, 0};
++    unsigned components[3] = {0}, qids[3] = {0};
++    int sof = 0, dht = 0;
++    if (!data || !out || length < 4 || data[0] != 255 || data[1] != 0xd8) return -1;
++    memset(out, 0, sizeof(*out));
++    while (pos < length) {
++        unsigned marker, size;
++        const uint8_t *p;
++        size_t n, k;
++        if (data[pos++] != 255) return -1;
++        while (pos < length && data[pos] == 255) ++pos;
++        if (pos >= length) return -1;
++        marker = data[pos++];
++        if (pos + 2 > length) return -1;
++        size = be16(data + pos);
++        if (size < 2 || size > length - pos) return -1;
++        p = data + pos + 2; n = size - 2; pos += size;
++        switch (marker) {
++        case 0xdb:
++            for (k = 0; k < n; k += 65) {
++                if (n - k < 65 || p[k] > 3) return -2;
++                quant[p[k]] = p + k + 1;
++            }
++            break;
++        case 0xc4:
++            k = 0;
++            while (k < n) {
++                size_t symbols = 0, t;
++                if (n - k < 17) return -1;
++                for (t = 1; t <= 16; ++t) symbols += p[k + t];
++                if (symbols > n - k - 17) return -1;
++                if (!default_dht(p + k, symbols + 17)) return -3;
++                dht |= 1 << ((p[k] & 1) * 2 + (p[k] >> 4));
++                k += symbols + 17;
++            }
++            break;
++        case 0xc0:
++            if (sof || n != 15 || p[0] != 8 || p[5] != 3) return -2;
++            out->height = be16(p + 1); out->width = be16(p + 3);
++            if (!out->width || !out->height || out->width > 2040 || out->height > 2040 ||
++                (out->width & 7) || (out->height & 7)) return -2;
++            if ((p[7] != 0x21 && p[7] != 0x22) || p[10] != 0x11 || p[13] != 0x11) return -2;
++            out->type = p[7] == 0x22 ? 1 : 0;
++            for (k = 0; k < 3; ++k) {
++                components[k] = p[6 + k * 3]; qids[k] = p[8 + k * 3];
++                if (qids[k] > 3) return -2;
++            }
++            if (components[0] == components[1] || components[0] == components[2] ||
++                components[1] == components[2] || qids[1] != qids[2]) return -2;
++            sof = 1;
++            break;
++        case 0xdd:
++            if (n != 2) return -1;
++            out->restart = be16(p);
++            break;
++        case 0xda:
++            if (!sof || n != 10 || p[0] != 3 || p[7] != 0 || p[8] != 63 || p[9] != 0) return -2;
++            for (k = 0; k < 3; ++k)
++                if (p[1 + k * 2] != components[k] || p[2 + k * 2] != (k ? 0x11 : 0)) return -2;
++            if (!quant[qids[0]] || !quant[qids[1]] || dht != 15) return -2;
++            memcpy(out->quant, quant[qids[0]], 64);
++            memcpy(out->quant + 64, quant[qids[1]], 64);
++            for (k = 0; k < 128; ++k) if (!out->quant[k]) return -2;
++            out->scan = data + pos;
++            while (pos + 1 < length) {
++                size_t marker_start = pos;
++                if (data[pos++] != 255) continue;
++                /* BK7252 word-aligns EOI with FF fill bytes. JPEG permits
++                 * repeated FF prefixes before markers, including EOI/RST.
++                 * Retain the extra fill in scan data for exact reconstruction. */
++                while (pos < length && data[pos] == 255) ++pos;
++                if (pos >= length) return -1;
++                marker = data[pos++];
++                if (marker == 0) {
++                    if (pos - marker_start != 2) return -2;
++                    continue;
++                }
++                if (marker >= 0xd0 && marker <= 0xd7 && out->restart) continue;
++                if (marker != 0xd9) return -2;
++                out->length = (data + pos - 2) - out->scan;
++                if (!out->length || out->length > 0xffffff) return -1;
++                if (out->restart) out->type += 64;
++                return 0; /* Ignore vendor trailer following EOI. */
++            }
++            return -1;
++        default:
++            /* Metadata is harmless; other coding modes are not. */
++            if (!((marker >= 0xe0 && marker <= 0xef) || marker == 0xfe)) return -2;
++        }
++    }
++    return -1;
++}
++
++size_t cam_rtp_packet(const struct cam_jpeg *j, size_t offset, uint8_t channel,
++                     uint16_t sequence, uint32_t timestamp, uint32_t ssrc,
++                     uint8_t *packet, size_t capacity, size_t *consumed)
++{
++    size_t header = 24 + (j->restart ? 4 : 0) + (offset == 0 ? 132 : 0);
++    size_t n, pos = 24;
++    *consumed = 0;
++    if (offset >= j->length || capacity <= header || capacity > 65539) return 0;
++    n = j->length - offset;
++    if (n > capacity - header) n = capacity - header;
++    packet[0] = '$'; packet[1] = channel; put16(packet + 2, header + n - 4);
++    packet[4] = 0x80; packet[5] = 26 | (offset + n == j->length ? 0x80 : 0);
++    put16(packet + 6, sequence); put32(packet + 8, timestamp); put32(packet + 12, ssrc);
++    packet[16] = 0; packet[17] = offset >> 16; packet[18] = offset >> 8; packet[19] = offset;
++    packet[20] = j->type; packet[21] = 255; packet[22] = j->width / 8; packet[23] = j->height / 8;
++    if (j->restart) { put16(packet + pos, j->restart); put16(packet + pos + 2, 0xffff); pos += 4; }
++    if (!offset) {
++        packet[pos] = packet[pos + 1] = 0; put16(packet + pos + 2, 128);
++        memcpy(packet + pos + 4, j->quant, 128); pos += 132;
++    }
++    memcpy(packet + pos, j->scan + offset, n);
++    *consumed = n;
++    return pos + n;
++}
+diff --git a/test/cam_rtp_jpeg.h b/test/cam_rtp_jpeg.h
+new file mode 100644
+index 0000000..074b082
+--- /dev/null
++++ b/test/cam_rtp_jpeg.h
+@@ -0,0 +1,18 @@
++#ifndef CAM_RTP_JPEG_H
++#define CAM_RTP_JPEG_H
++#include <stddef.h>
++#include <stdint.h>
++struct cam_jpeg {
++    const uint8_t *scan;
++    size_t length;
++    uint8_t quant[128];
++    uint16_t width, height, restart;
++    uint8_t type;
++};
++int cam_jpeg_parse(const uint8_t *data, size_t length, struct cam_jpeg *out);
++/* Returns complete interleaved TCP packet length, or zero. Offset counts
++ * entropy bytes only; caller advances by *consumed. */
++size_t cam_rtp_packet(const struct cam_jpeg *j, size_t offset, uint8_t channel,
++                     uint16_t sequence, uint32_t timestamp, uint32_t ssrc,
++                     uint8_t *packet, size_t capacity, size_t *consumed);
++#endif
+diff --git a/test/cam_rtsp.c b/test/cam_rtsp.c
+new file mode 100644
+index 0000000..6d4821c
+--- /dev/null
++++ b/test/cam_rtsp.c
+@@ -0,0 +1,516 @@
++/* One video consumer, RTSP/1.0 and RFC 2435 RTP/JPEG over interleaved TCP. */
++#ifdef CAM_RTSP_HOST
++#include "cam_rtsp_host.h"
++#else
++#include "include.h"
++#include <rtthread.h>
++#include <finsh.h>
++#include <dfs_posix.h>
++#include <sys/socket.h>
++#include "net.h"
++#include "video_transfer.h"
++#endif
++#include <stdlib.h>
++#include <stdio.h>
++#include <string.h>
++#include <stdint.h>
++#include <ctype.h>
++#include <errno.h>
++#include "cam_rtp_jpeg.h"
++#include "cam_frame_pool.h"
++#include "cam_snapshot.h"
++#include "cam_stream_info.h"
++
++#define CAM_PORT 8554
++#define CAM_FRAME_MAX (48u * 1024u) /* Three slots fit the measured SDRAM heap. */
++#define CAM_CAPTURE_TIMEOUT_MS 500 /* Allow slow exposure; bound shutdown. */
++#define CAM_INPUT_MAX 2048
++#define CAM_PACKET_MAX 1400 /* One complete interleaved record fits TCP MSS. */
++#define CAM_SEND_BATCH (2 * CAM_PACKET_MAX)
++static volatile int cam_running, cam_stop;
++static unsigned cam_clients, cam_frames, cam_bad_frames;
++static unsigned cam_captured, cam_replaced, cam_timeouts;
++static unsigned cam_tcp_frames,cam_stale;
++static unsigned cam_send_calls,cam_send_ms_max,cam_send_slow,cam_frame_ms_max,cam_age_ms_max;
++struct cam_capture {
++    struct cam_frame_pool pool;
++    uint8_t *frames;
++    rt_mutex_t lock;
++    rt_sem_t ready, done;
++    volatile int stop;
++};
++static void cam_capture_thread(void *arg) {
++    struct cam_capture *c=arg;
++    while(!c->stop) {
++        int slot, signal; uint32_t length, tick;
++        rt_mutex_take(c->lock,RT_WAITING_FOREVER);
++        slot=cam_pool_reserve(&c->pool);
++        rt_mutex_release(c->lock);
++        if(slot<0){rt_thread_delay(1);continue;}
++        length=video_buffer_read_frame_timeout(c->frames+(size_t)slot*CAM_FRAME_MAX,CAM_FRAME_MAX,CAM_CAPTURE_TIMEOUT_MS);
++        tick=(uint32_t)rt_tick_get();
++        if(length)cam_snapshot_offer(c->frames+(size_t)slot*CAM_FRAME_MAX,length,tick);
++        rt_mutex_take(c->lock,RT_WAITING_FOREVER);
++        signal=cam_pool_commit(&c->pool,length,tick);
++        cam_captured=c->pool.captured;cam_replaced=c->pool.replaced;
++        if(!length)++cam_timeouts;
++        if(signal)rt_sem_release(c->ready);
++        rt_mutex_release(c->lock);
++    }
++    rt_sem_release(c->done);
++}
++static int cam_capture_take(struct cam_capture *c, uint8_t **frame, uint32_t *length, uint32_t *tick) {
++    int slot;
++    if(rt_sem_take(c->ready,rt_tick_from_millisecond(200))!=RT_EOK)return -1;
++    rt_mutex_take(c->lock,RT_WAITING_FOREVER);
++    slot=cam_pool_take(&c->pool);
++    if(slot>=0){*frame=c->frames+(size_t)slot*CAM_FRAME_MAX;*length=c->pool.length[slot];*tick=c->pool.tick[slot];}
++    rt_mutex_release(c->lock);return slot;
++}
++static void cam_capture_release(struct cam_capture *c,int slot) {
++    rt_mutex_take(c->lock,RT_WAITING_FOREVER);cam_pool_release(&c->pool,slot);rt_mutex_release(c->lock);
++}
++
++int cam_rtsp_active(void) { return cam_running; }
++void cam_stream_get_info(struct cam_stream_info *info) {
++    VIDEO_TRANSFER_STATS_ST source;video_transfer_get_stats(&source);
++    info->source_frames=source.frames;info->captured=cam_captured;
++    info->replaced=cam_replaced;info->bad=cam_bad_frames;
++}
++
++struct cam_session {
++    int fd, setup, playing, teardown, report_pending;
++    unsigned channel, rtcp_channel;
++    uint16_t sequence;
++    uint32_t ssrc, timestamp, origin, activity, report, packets, octets;
++    char id[16];
++    char input[CAM_INPUT_MAX + 1];
++    size_t used;
++    unsigned discard;
++    uint8_t packet[CAM_SEND_BATCH];
++};
++
++static uint32_t cam_ticks(void) { return (uint32_t)rt_tick_get(); }
++static uint32_t cam_ms(uint32_t ticks) {
++    return (uint32_t)((uint64_t)ticks * 1000 / RT_TICK_PER_SECOND);
++}
++static void cam_put32(uint8_t *p, uint32_t v) {
++    p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v;
++}
++static int cam_send(struct cam_session *s, const void *data, size_t length)
++{
++    const char *p = data;
++    uint32_t start = cam_ticks();
++    while (length && !cam_stop) {
++        uint32_t at=cam_ticks();
++        int n = send(s->fd, p, length, 0);
++        unsigned elapsed=cam_ms(cam_ticks()-at);
++        ++cam_send_calls;if(elapsed>cam_send_ms_max)cam_send_ms_max=elapsed;
++        if(elapsed>100)++cam_send_slow;
++        if (n <= 0) return -1;
++        p += n; length -= n;
++        if (cam_ms(cam_ticks() - start) >= 2000 && length) return -1;
++    }
++    return length ? -1 : 0;
++}
++static int cam_response(struct cam_session *s, unsigned cseq, unsigned code,
++                        const char *reason, const char *headers, const char *body)
++{
++    char response[1536];
++    size_t length = body ? strlen(body) : 0;
++    int n = snprintf(response, sizeof(response),
++        "RTSP/1.0 %u %s\r\nCSeq: %u\r\nServer: HB6\r\n%sContent-Length: %u\r\n\r\n%s",
++        code, reason, cseq, headers ? headers : "", (unsigned)length, body ? body : "");
++    if (n < 0 || (size_t)n >= sizeof(response)) return -1;
++    return cam_send(s, response, n);
++}
++static int cam_equal(const char *a, const char *b, size_t n)
++{
++    size_t i;
++    for (i = 0; i < n; ++i)
++        if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i])) return 0;
++    return 1;
++}
++/* Find one header only. Reject duplicates instead of interpreting conflicting
++ * Content-Length/CSeq/Session values differently in different layers. */
++static int cam_header(const char *request, const char *name, char *value, size_t cap)
++{
++    const char *p = strstr(request, "\r\n");
++    size_t key = strlen(name);
++    int found = 0;
++    if (!p) return -1;
++    p += 2;
++    while (*p && strncmp(p, "\r\n", 2)) {
++        const char *end = strstr(p, "\r\n"), *colon;
++        if (!end) return -1;
++        colon = memchr(p, ':', end - p);
++        if (!colon) return -1;
++        if ((size_t)(colon - p) == key && cam_equal(p, name, key)) {
++            const char *v = colon + 1, *tail = end;
++            if (found++) return -1;
++            while (v < tail && (*v == ' ' || *v == '\t')) ++v;
++            while (tail > v && (tail[-1] == ' ' || tail[-1] == '\t')) --tail;
++            if ((size_t)(tail - v) >= cap) return -1;
++            memcpy(value, v, tail - v); value[tail - v] = 0;
++        }
++        p = end + 2;
++    }
++    return found;
++}
++static int cam_number(const char *text, unsigned *n)
++{
++    unsigned value = 0;
++    if (!*text) return -1;
++    while (*text) {
++        unsigned digit = (unsigned char)*text++ - '0';
++        if (digit > 9 || value > (0x7fffffffu - digit) / 10) return -1;
++        value = value * 10 + digit;
++    }
++    *n = value;
++    return 0;
++}
++/* Exactly one unicast transport; never accept an arbitrary destination IP. */
++static int cam_transport(const char *text, unsigned *rtp, unsigned *rtcp)
++{
++    char copy[256], *p, *token;
++    int seen=0,unicast=0;
++    if(strlen(text)>=sizeof(copy))return -1;
++    strcpy(copy,text);token=strchr(copy,';');if(!token)return -1;*token++=0;
++    /* UDP exhausts the vendor Wi-Fi TX allocator on this board. */
++    if(strcmp(copy,"RTP/AVP/TCP"))return -1;
++    p=token;
++    while(p) {
++        char *end=strchr(p,';');if(end)*end++=0;
++        if(!strcmp(p,"unicast")){if(unicast++)return -1;}
++        else if(!strncmp(p,"interleaved=",12)) {
++            char *dash=strchr(p+12,'-');if(seen++ || !dash)return -1;*dash++=0;
++            if(cam_number(p+12,rtp) || cam_number(dash,rtcp))return -1;
++            if(*rtp>255 || *rtcp>255 || *rtp==*rtcp)return -1;
++        } else if(strcmp(p,"mode=play") && strcmp(p,"mode=\"PLAY\""))return -1;
++        p=end;
++    }
++    return seen==1 && unicast==1?0:-1;
++}
++static int cam_request(struct cam_session *s, const char *request)
++{
++    char method[24], uri[384], version[16], value[256], headers[512];
++    unsigned cseq = 0;
++    const char *path;
++    int session;
++    if (cam_header(request, "CSeq", value, sizeof(value)) != 1 || cam_number(value, &cseq)) {
++        cam_response(s, 0, 400, "Bad Request", 0, 0);
++        return -1;
++    }
++    if (sscanf(request, "%23s %383s %15s", method, uri, version) != 3 || strcmp(version, "RTSP/1.0"))
++        return cam_response(s, cseq, 400, "Bad Request", 0, 0);
++    path = uri;
++    if (!strncmp(uri, "rtsp://", 7)) {
++        path = strchr(uri + 7, '/');
++        if (!path) path = "/";
++    }
++    if (strcmp(method, "OPTIONS") && strcmp(path, "/stream") &&
++        strcmp(path, "/stream/") && strcmp(path, "/stream/track0"))
++        return cam_response(s, cseq, 404, "Not Found", 0, 0);
++    session = cam_header(request, "Session", value, sizeof(value));
++    if (session < 0) return cam_response(s, cseq, 400, "Bad Request", 0, 0);
++    if (session) {
++        char *semi = strchr(value, ';');
++        if (semi) *semi = 0;
++        if (!s->setup || strcmp(value, s->id))
++            return cam_response(s, cseq, 454, "Session Not Found", 0, 0);
++    }
++    s->activity = cam_ticks();
++    if (!strcmp(method, "OPTIONS"))
++        return cam_response(s, cseq, 200, "OK",
++            "Public: OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, GET_PARAMETER, TEARDOWN\r\n", 0);
++    if (!strcmp(method, "DESCRIBE")) {
++        static const char sdp[] = "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\ns=HB6 camera\r\n"
++            "c=IN IP4 0.0.0.0\r\nt=0 0\r\na=control:*\r\n"
++            "m=video 0 RTP/AVP 26\r\na=rtpmap:26 JPEG/90000\r\na=control:track0\r\n";
++        if (strcmp(path, "/stream") && strcmp(path, "/stream/"))
++            return cam_response(s, cseq, 404, "Not Found", 0, 0);
++        snprintf(headers, sizeof(headers), "Content-Type: application/sdp\r\nContent-Base: %s%s\r\n",
++                 uri, uri[strlen(uri) - 1] == '/' ? "" : "/");
++        return cam_response(s, cseq, 200, "OK", headers, sdp);
++    }
++    if (!strcmp(method, "SETUP")) {
++        unsigned channel = 0, rtcp = 1;
++        if (strcmp(path, "/stream/track0")) return cam_response(s, cseq, 404, "Not Found", 0, 0);
++        if (s->setup) return cam_response(s, cseq, 455, "Method Not Valid in This State", 0, 0);
++        if (cam_header(request, "Transport", value, sizeof(value)) != 1 || cam_transport(value, &channel, &rtcp))
++            return cam_response(s, cseq, 461, "Unsupported Transport", 0, 0);
++        s->channel = channel; s->rtcp_channel = rtcp; s->setup = 1;
++        snprintf(headers, sizeof(headers), "Session: %s;timeout=60\r\n"
++                 "Transport: RTP/AVP/TCP;unicast;interleaved=%u-%u;ssrc=%08X\r\n",
++                 s->id, channel, rtcp, (unsigned)s->ssrc);
++        return cam_response(s, cseq, 200, "OK", headers, 0);
++    }
++    if (!strcmp(method, "PLAY") || !strcmp(method, "PAUSE") ||
++        !strcmp(method, "GET_PARAMETER") || !strcmp(method, "TEARDOWN")) {
++        if (!session || !s->setup) return cam_response(s, cseq, 454, "Session Not Found", 0, 0);
++        snprintf(headers, sizeof(headers), "Session: %s\r\n", s->id);
++        if (!strcmp(method, "PLAY")) {
++            if (s->playing) return cam_response(s, cseq, 455, "Method Not Valid in This State", 0, 0);
++            s->playing = 1;
++            s->report_pending = 1;
++            s->report = cam_ticks();
++        } else if (!strcmp(method, "PAUSE")) {
++            if (!s->playing) return cam_response(s, cseq, 455, "Method Not Valid in This State", 0, 0);
++            s->playing = 0;
++        } else if (!strcmp(method, "TEARDOWN")) {
++            s->playing = 0; s->teardown = 1;
++        }
++        return cam_response(s, cseq, 200, "OK", headers, 0);
++    }
++    return cam_response(s, cseq, 405, "Method Not Allowed", 0, 0);
++}
++
++/* TCP requests and RTCP can be split/coalesced arbitrarily. Keep incomplete
++ * requests, consume their bounded bodies, and drain interleaved packets. */
++static int cam_input(struct cam_session *s)
++{
++    for (;;) {
++        size_t total, header;
++        char value[32], *end;
++        unsigned body = 0;
++        if (s->discard) {
++            size_t n = s->used < s->discard ? s->used : s->discard;
++            memmove(s->input, s->input + n, s->used - n);
++            s->used -= n; s->discard -= n;
++            if (s->discard) return 0;
++        }
++        if (!s->used) return 0;
++        if (s->input[0] == '$') {
++            if (s->used < 4) return 0;
++            if (!s->setup || (uint8_t)s->input[1] != s->rtcp_channel) return -1;
++            s->discard = ((uint8_t)s->input[2] << 8) | (uint8_t)s->input[3];
++            memmove(s->input, s->input + 4, s->used - 4); s->used -= 4;
++            s->activity = cam_ticks();
++            continue;
++        }
++        s->input[s->used] = 0;
++        end = strstr(s->input, "\r\n\r\n");
++        if (!end) return s->used == CAM_INPUT_MAX || memchr(s->input, 0, s->used) ? -1 : 0;
++        header = end + 4 - s->input;
++        if (memchr(s->input, 0, header)) return -1;
++        /* Temporarily isolate headers; following pipelined bytes are binary. */
++        { char saved = s->input[header];
++          int found;
++          s->input[header] = 0;
++          found = cam_header(s->input, "Content-Length", value, sizeof(value));
++          s->input[header] = saved;
++          if (found < 0 || (found && cam_number(value, &body))) return -1;
++        }
++        total = header + body;
++        if (total > CAM_INPUT_MAX) return -1;
++        if (total > s->used) return 0;
++        { char saved = s->input[header]; int result;
++          s->input[header] = 0;
++          result = cam_request(s, s->input);
++          s->input[header] = saved;
++          if (result) return -1;
++        }
++        memmove(s->input, s->input + total, s->used - total); s->used -= total;
++        if (s->teardown) return 0;
++    }
++}
++
++static int cam_report(struct cam_session *s, uint32_t tick)
++{
++    uint8_t p[64] = {0};
++    char cname[24];
++    size_t name, sdes, length;
++    uint32_t sec = tick / RT_TICK_PER_SECOND;
++    uint32_t frac = ((uint64_t)(tick % RT_TICK_PER_SECOND) << 32) / RT_TICK_PER_SECOND;
++    snprintf(cname, sizeof(cname), "%08x@hb6", (unsigned)s->ssrc);
++    name = strlen(cname); sdes = (4 + 4 + 2 + name + 1 + 3) & ~3u;
++    length = 28 + sdes;
++    p[0] = '$'; p[1] = s->rtcp_channel; p[2] = length >> 8; p[3] = length;
++    p[4] = 0x80; p[5] = 200; p[7] = 6;
++    /* No wall clock is configured on the board. RFC 3550 permits relative
++     * NTP timestamps from uptime; high bit zero distinguishes them from
++     * contemporary absolute NTP time. Send the first SR before any RTP. */
++    cam_put32(p + 8, s->ssrc); cam_put32(p + 12, sec);
++    cam_put32(p + 16, frac);
++    cam_put32(p + 20, (uint32_t)((uint64_t)(tick - s->origin) * 90000 / RT_TICK_PER_SECOND));
++    cam_put32(p + 24, s->packets); cam_put32(p + 28, s->octets);
++    p[32] = 0x81; p[33] = 202; p[35] = sdes / 4 - 1;
++    cam_put32(p + 36, s->ssrc); p[40] = 1; p[41] = name;
++    memcpy(p + 42, cname, name);
++    return cam_send(s, p, length + 4);
++}
++static void cam_client(int fd, struct cam_capture *capture)
++{
++    struct cam_session *s = calloc(1, sizeof(*s));
++    struct timeval timeout = {2, 0};
++    unsigned bad = 0;
++    int frame_slot = -1;
++    uint8_t *frame = NULL;
++    uint32_t last_frame = cam_ticks();
++    if (!s) return;
++    s->fd = fd; s->origin = s->activity = cam_ticks();
++    s->ssrc = 0x48423600u ^ s->origin ^ ++cam_clients;
++    s->sequence = s->ssrc;
++    snprintf(s->id, sizeof(s->id), "%08x", (unsigned)s->ssrc);
++    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout))) goto done;
++    { int on = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on)); }
++    rt_kprintf("RTSP client connected; session %s\n", s->id);
++    while (!cam_stop && !s->teardown && cam_ms(cam_ticks() - s->activity) < 60000) {
++        fd_set readset;
++        int ready;
++        timeout.tv_sec = 0; timeout.tv_usec = s->playing ? 0 : 200000;
++        FD_ZERO(&readset); FD_SET(fd, &readset);
++        ready = select(fd + 1, &readset, 0, 0, &timeout);
++        if (ready < 0) break;
++        if (ready && FD_ISSET(fd,&readset)) {
++            int n = recv(fd, s->input + s->used, CAM_INPUT_MAX - s->used, 0);
++            if (n <= 0) break;
++            s->used += n;
++            if (cam_input(s) || s->teardown) break;
++        }
++        if (s->playing) {
++            struct cam_jpeg j;
++            size_t offset = 0; uint32_t length = 0, captured_tick = 0;
++            uint32_t tick,send_start;unsigned age,frame_ms;
++            int result;
++            tick = cam_ticks();
++            if (s->report_pending || cam_ms(tick - s->report) >= 5000) {
++                if (cam_report(s, tick)) break;
++                s->report = tick; s->report_pending = 0;
++            }
++            frame_slot = cam_capture_take(capture, &frame, &length, &captured_tick);
++            tick = cam_ticks();
++            if (frame_slot < 0) {
++                if (cam_ms(tick - last_frame) >= 5000) {
++                    rt_kprintf("RTSP: no camera frames for 5s; disconnecting\n"); break;
++                }
++                continue;
++            }
++            last_frame = tick;
++            age=cam_ms(tick-captured_tick);if(age>cam_age_ms_max)cam_age_ms_max=age;
++            if(age>150){++cam_stale;cam_capture_release(capture,frame_slot);frame_slot=-1;continue;}
++            result = cam_jpeg_parse(frame, length, &j);
++            if (result) {
++                ++cam_bad_frames;
++                if (!bad++) rt_kprintf("RTSP: unsupported/malformed JPEG, error=%d length=%u\n", result, (unsigned)length);
++                cam_capture_release(capture,frame_slot);frame_slot=-1;
++                if (bad >= 10) break;
++                continue;
++            }
++            bad = 0;
++            if ((uint32_t)(tick-captured_tick) > (uint32_t)(tick-s->origin)) captured_tick=s->origin;
++            s->timestamp = (uint32_t)((uint64_t)(captured_tick - s->origin) * 90000 / RT_TICK_PER_SECOND);
++            send_start=cam_ticks();
++            while (offset < j.length && !cam_stop) {
++                size_t batch = 0;
++                unsigned count;
++                /* Coalesce two records per socket write. Do not wait for a
++                 * second camera frame: the last record is flushed immediately. */
++                for (count = 0; count < 2 && offset < j.length; ++count) {
++                    size_t consumed, n = cam_rtp_packet(&j, offset, s->channel, s->sequence++,
++                        s->timestamp, s->ssrc, s->packet + batch, CAM_PACKET_MAX, &consumed);
++                    if (!n) goto done;
++                    offset += consumed;
++                    batch+=n;
++                    ++s->packets; s->octets += n - 16;
++                }
++                if (cam_send(s, s->packet, batch)) goto done;
++            }
++            if (cam_stop) break;
++            frame_ms=cam_ms(cam_ticks()-send_start);if(frame_ms>cam_frame_ms_max)cam_frame_ms_max=frame_ms;
++            ++cam_frames; ++cam_tcp_frames;
++            cam_capture_release(capture,frame_slot);frame_slot=-1;
++        } else last_frame = cam_ticks();
++    }
++done:
++    if(frame_slot>=0)cam_capture_release(capture,frame_slot);
++    rt_kprintf("RTSP client disconnected\n");
++    free(s);
++}
++static void cam_server(void *arg)
++{
++    struct sockaddr_in addr;
++    struct cam_capture capture;
++    rt_thread_t producer=RT_NULL;
++    int producer_started=0;
++    memset(&capture,0,sizeof(capture));cam_pool_init(&capture.pool);
++    capture.frames=malloc((size_t)CAM_FRAME_SLOTS*CAM_FRAME_MAX);
++    capture.lock=rt_mutex_create("camlock",RT_IPC_FLAG_FIFO);
++    capture.ready=rt_sem_create("camready",0,RT_IPC_FLAG_FIFO);
++    capture.done=rt_sem_create("camdone",0,RT_IPC_FLAG_FIFO);
++    int listener = -1, on = 1;
++    (void)arg;
++    if (!capture.frames || !capture.lock || !capture.ready || !capture.done) goto done;
++    listener = socket(AF_INET, SOCK_STREAM, 0);
++    if (listener < 0) goto done;
++    setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
++    memset(&addr, 0, sizeof(addr)); addr.sin_family = AF_INET;
++    addr.sin_addr.s_addr = htonl(INADDR_ANY); addr.sin_port = htons(CAM_PORT);
++    if (bind(listener, (struct sockaddr *)&addr, sizeof(addr)) || listen(listener, 1)) goto done;
++    if(video_buffer_open()!=0)goto done;
++    cam_captured=cam_replaced=cam_timeouts=0;
++    producer=rt_thread_create("camcap",cam_capture_thread,&capture,2048,19,10);
++    if(!producer)goto done;
++    if(rt_thread_startup(producer)!=RT_EOK){rt_thread_delete(producer);producer=RT_NULL;goto done;}
++    producer_started=1;
++    rt_kprintf("RTSP listening: rtsp://<camera-ip>:8554/stream (TCP)\n");
++    while (!cam_stop) {
++        fd_set readset;
++        struct timeval timeout = {0, 200000};
++        int ready, client;
++        FD_ZERO(&readset); FD_SET(listener, &readset);
++        ready = select(listener + 1, &readset, 0, 0, &timeout);
++        if (ready < 0) break;
++        if (!ready) continue;
++        client = accept(listener, 0, 0);
++        if (client < 0) continue;
++        cam_client(client, &capture);
++        close(client);
++    }
++done:
++    if (listener >= 0) close(listener);
++    capture.stop=1;
++    if(producer_started)rt_sem_take(capture.done,RT_WAITING_FOREVER);
++    if(capture.ready)rt_sem_delete(capture.ready);
++    if(capture.done)rt_sem_delete(capture.done);
++    if(capture.lock)rt_mutex_delete(capture.lock);
++    free(capture.frames);
++    cam_running = 0;
++    rt_kprintf("RTSP server stopped (camera remains initialized)\n");
++}
++int rtsp_cam(int argc, char **argv)
++{
++    if (argc != 2) { rt_kprintf("rtsp_cam start|stop|status\n"); return -1; }
++    if (!strcmp(argv[1], "status")) {
++        VIDEO_BUFFER_STATS_ST stats;
++        VIDEO_TRANSFER_STATS_ST source;
++        video_buffer_get_stats(&stats);
++        video_transfer_get_stats(&source);
++        rt_kprintf("RTSP running=%d clients=%u frames=%u bad=%u captured=%u replaced=%u timeouts=%u\n", cam_running, cam_clients, cam_frames, cam_bad_frames,cam_captured,cam_replaced,cam_timeouts);
++        rt_kprintf("VBUF started=%u valid=%u overflows=%u invalid=%u gaps=%u timeouts=%u max_bytes=%u\n",
++                   (unsigned)stats.started,(unsigned)stats.valid,(unsigned)stats.overflows,
++                   (unsigned)stats.invalid,(unsigned)stats.gaps,(unsigned)stats.timeouts,
++                   (unsigned)stats.max_frame_len);
++        rt_kprintf("VIDEO source_frames=%u node_drops=%u queue_drops=%u\n",
++                   (unsigned)source.frames,(unsigned)source.node_drops,(unsigned)source.queue_drops);
++        rt_kprintf("TRANSPORT mode=TCP tcp_frames=%u stale=%u send_calls=%u slow_sends=%u send_max_ms=%u frame_max_ms=%u age_max_ms=%u\n",cam_tcp_frames,cam_stale,cam_send_calls,cam_send_slow,cam_send_ms_max,cam_frame_ms_max,cam_age_ms_max);
++        return 0;
++    }
++    if (!strcmp(argv[1], "stop")) { cam_stop = 1; return 0; }
++    if (strcmp(argv[1], "start")) return -1;
++    if (cam_running) { rt_kprintf("RTSP already running\n"); return -1; }
++    /* The shared SDK frame buffer supports exactly one reader. */
++    if (rt_thread_find("jpeg_stream")) {
++        rt_kprintf("HTTP camera task active; reboot and start RTSP first\n"); return -1;
++    }
++    { rt_thread_t thread;
++      cam_stop = 0; cam_running = 1;
++      thread = rt_thread_create("rtspcam", cam_server, 0, 6144, 20, 10);
++      if (!thread) { cam_running = 0; return -1; }
++      if (rt_thread_startup(thread)) { rt_thread_delete(thread); cam_running = 0; return -1; }
++    }
++    return 0;
++}
++#ifndef CAM_RTSP_HOST
++MSH_CMD_EXPORT(rtsp_cam, RTSP JPEG camera on TCP port 8554);
++#endif
+diff --git a/test/cam_snapshot.c b/test/cam_snapshot.c
+new file mode 100644
+index 0000000..b0b8ea4
+--- /dev/null
++++ b/test/cam_snapshot.c
+@@ -0,0 +1,55 @@
++/* One bounded snapshot mailbox. Capture never waits for MQTT/network IO.
++ * Scheduler locks protect metadata only; copying/publishing occurs outside. */
++#include <rtthread.h>
++#include <string.h>
++#include "cam_snapshot.h"
++enum { EMPTY, REQUESTED, WRITING, READY, READING };
++static unsigned state, enabled;
++static uint8_t *pieces[CAM_SNAPSHOT_CHUNKS];
++static size_t image_length;
++static uint32_t captured_tick;
++int cam_snapshot_enable(void) {
++    unsigned i;
++    if(enabled)return 0;
++    for(i=0;i<CAM_SNAPSHOT_CHUNKS;++i) {
++        pieces[i]=rt_malloc(CAM_SNAPSHOT_CHUNK);
++        if(!pieces[i]) {
++            while(i)rt_free(pieces[--i]);
++            memset(pieces,0,sizeof(pieces));return -1;
++        }
++    }
++    rt_enter_critical();enabled=1;state=EMPTY;rt_exit_critical();return 0;
++}
++void cam_snapshot_request(void) {
++    rt_enter_critical();if(enabled && state==EMPTY)state=REQUESTED;rt_exit_critical();
++}
++void cam_snapshot_offer(const uint8_t *frame,size_t length,uint32_t tick) {
++    size_t offset;
++    rt_enter_critical();
++    if(!enabled || state!=REQUESTED){rt_exit_critical();return;}
++    state=WRITING;rt_exit_critical();
++    /* SDK appends five transport bytes after EOI; publish a full JPEG only. */
++    if(length<9 || length-5>CAM_SNAPSHOT_MAX || frame[0]!=0xff || frame[1]!=0xd8 ||
++       frame[length-7]!=0xff || frame[length-6]!=0xd9) {
++        rt_enter_critical();state=REQUESTED;rt_exit_critical();return;
++    }
++    length-=5;
++    for(offset=0;offset<length;) {
++        size_t n=length-offset;if(n>CAM_SNAPSHOT_CHUNK)n=CAM_SNAPSHOT_CHUNK;
++        memcpy(pieces[offset/CAM_SNAPSHOT_CHUNK],frame+offset,n);offset+=n;
++    }
++    rt_enter_critical();image_length=length;captured_tick=tick;state=READY;rt_exit_critical();
++}
++size_t cam_snapshot_take(uint32_t *tick) {
++    size_t length=0;
++    rt_enter_critical();if(state==READY){state=READING;length=image_length;*tick=captured_tick;}rt_exit_critical();return length;
++}
++const uint8_t *cam_snapshot_piece(size_t offset,size_t *length) {
++    size_t n;
++    if(state!=READING || offset>=image_length)return NULL;
++    n=image_length-offset;if(n>CAM_SNAPSHOT_CHUNK-offset%CAM_SNAPSHOT_CHUNK)n=CAM_SNAPSHOT_CHUNK-offset%CAM_SNAPSHOT_CHUNK;
++    *length=n;return pieces[offset/CAM_SNAPSHOT_CHUNK]+offset%CAM_SNAPSHOT_CHUNK;
++}
++void cam_snapshot_release(void) {
++    rt_enter_critical();if(state==READING)state=EMPTY;rt_exit_critical();
++}
+diff --git a/test/cam_snapshot.h b/test/cam_snapshot.h
+new file mode 100644
+index 0000000..6f80115
+--- /dev/null
++++ b/test/cam_snapshot.h
+@@ -0,0 +1,14 @@
++#ifndef CAM_SNAPSHOT_H
++#define CAM_SNAPSHOT_H
++#include <stddef.h>
++#include <stdint.h>
++#define CAM_SNAPSHOT_CHUNK (12u*1024u)
++#define CAM_SNAPSHOT_CHUNKS 4
++#define CAM_SNAPSHOT_MAX (CAM_SNAPSHOT_CHUNK*CAM_SNAPSHOT_CHUNKS)
++int cam_snapshot_enable(void);
++void cam_snapshot_request(void);
++void cam_snapshot_offer(const uint8_t *,size_t,uint32_t);
++size_t cam_snapshot_take(uint32_t *);
++const uint8_t *cam_snapshot_piece(size_t,size_t *);
++void cam_snapshot_release(void);
++#endif
+diff --git a/test/cam_stream_info.h b/test/cam_stream_info.h
+new file mode 100644
+index 0000000..13b0ce9
+--- /dev/null
++++ b/test/cam_stream_info.h
+@@ -0,0 +1,6 @@
++#ifndef CAM_STREAM_INFO_H
++#define CAM_STREAM_INFO_H
++#include <stdint.h>
++struct cam_stream_info { uint32_t source_frames,captured,replaced,bad; };
++void cam_stream_get_info(struct cam_stream_info *);
++#endif
+diff --git a/test/cam_wifi_config.c b/test/cam_wifi_config.c
+new file mode 100644
+index 0000000..061ecbc
+--- /dev/null
++++ b/test/cam_wifi_config.c
+@@ -0,0 +1,78 @@
++#include "cam_wifi_config.h"
++#include <string.h>
++static int valid(const struct cam_wifi_config *c) {
++    size_t s = strlen(c->ssid), p = strlen(c->password);
++    return s >= 1 && s <= 32 && (p == 0 || (p >= 8 && p <= 63));
++}
++int cam_wifi_parse(const char *text, size_t length, struct cam_wifi_config *out) {
++    struct cam_wifi_config c = {{0}, {0}};
++    size_t pos = 0; unsigned seen = 0;
++    if (length > 512 || memchr(text, 0, length)) return -1;
++    if (length >= 3 && !memcmp(text, "\xef\xbb\xbf", 3)) pos = 3;
++    while (pos < length) {
++        size_t begin = pos, end, key, n; const char *eq; char *dst; unsigned flag, cap;
++        while (pos < length && text[pos] != '\n') ++pos;
++        end = pos; if (pos < length) ++pos;
++        if (end > begin && text[end-1] == '\r') --end;
++        if (end == begin || text[begin] == '#') continue;
++        eq = memchr(text + begin, '=', end - begin);
++        if (!eq) return -1;
++        key = (size_t)(eq - text - begin); n = end - (size_t)(eq - text) - 1;
++        if (key == 4 && !memcmp(text + begin, "ssid", 4)) {
++            dst = c.ssid; cap = sizeof(c.ssid); flag = 1;
++        } else if (key == 8 && !memcmp(text + begin, "password", 8)) {
++            dst = c.password; cap = sizeof(c.password); flag = 2;
++        } else return -1;
++        if ((seen & flag) || n >= cap || memchr(eq + 1, '\r', n)) return -1;
++        memcpy(dst, eq + 1, n); dst[n] = 0; seen |= flag;
++    }
++    if (seen != 3 || !valid(&c)) return -1;
++    *out = c; return 0;
++}
++static const char hex[] = "0123456789abcdef";
++int cam_wifi_encode(const struct cam_wifi_config *cfg, char out[CAM_WIFI_RECORD_MAX]) {
++    const char *parts[2]; size_t i, j, k = 3;
++    if (!valid(cfg)) return -1;
++    parts[0] = cfg->ssid; parts[1] = cfg->password;
++    memcpy(out, "01:", 3);
++    for (j = 0; j < 2; ++j) {
++        if (j) out[k++] = ':';
++        for (i = 0; parts[j][i]; ++i) {
++            unsigned char b = parts[j][i]; out[k++] = hex[b >> 4]; out[k++] = hex[b & 15];
++        }
++    }
++    out[k] = 0; return 0;
++}
++static int nibble(char c) {
++    const char *p = strchr(hex, c); return (c && p) ? (int)(p - hex) : -1;
++}
++int cam_wifi_decode(const char *record, struct cam_wifi_config *out) {
++    struct cam_wifi_config c = {{0}, {0}}; char *parts[2]; size_t caps[2], j, i, k = 3;
++    if (!record || strlen(record) >= CAM_WIFI_RECORD_MAX || strncmp(record, "01:", 3)) return -1;
++    parts[0] = c.ssid; parts[1] = c.password; caps[0] = sizeof(c.ssid); caps[1] = sizeof(c.password);
++    for (j = 0; j < 2; ++j) {
++        i = 0;
++        while (record[k] && record[k] != ':') {
++            int a = nibble(record[k]), b = nibble(record[k+1]);
++            if (a < 0 || b < 0 || i + 1 >= caps[j] || !(a || b)) return -1;
++            parts[j][i++] = (char)((a << 4) | b); k += 2;
++        }
++        if (!j) { if (record[k] != ':') return -1; ++k; }
++        else if (record[k]) return -1;
++    }
++    if (!valid(&c)) return -1; *out = c; return 0;
++}
++unsigned cam_auto_step(struct cam_auto_policy *p, uint32_t now, uint32_t retry,
++                       int configured, int changed, int ready, int server) {
++    unsigned actions = 0;
++    if (changed) { p->tried = 0; ready = 0; }
++    if (p->was_ready && !ready && !changed) { p->tried = 1; p->join_at = now; }
++    if (configured && !ready && (!p->tried || (uint32_t)(now - p->join_at) >= retry)) {
++        p->tried = 1; p->join_at = now; actions |= CAM_AUTO_JOIN;
++    }
++    if (ready && !server && (!p->server_tried || (uint32_t)(now - p->server_at) >= retry)) {
++        p->server_tried = 1; p->server_at = now; actions |= CAM_AUTO_RTSP;
++    }
++    if (server) p->server_tried = 0;
++    p->was_ready = ready; return actions;
++}
+diff --git a/test/cam_wifi_config.h b/test/cam_wifi_config.h
+new file mode 100644
+index 0000000..e06075e
+--- /dev/null
++++ b/test/cam_wifi_config.h
+@@ -0,0 +1,16 @@
++#ifndef CAM_WIFI_CONFIG_H
++#define CAM_WIFI_CONFIG_H
++#include <stddef.h>
++#include <stdint.h>
++#define CAM_WIFI_RECORD_MAX 196
++struct cam_wifi_config { char ssid[33]; char password[64]; };
++int cam_wifi_parse(const char *text, size_t length, struct cam_wifi_config *out);
++int cam_wifi_encode(const struct cam_wifi_config *cfg, char out[CAM_WIFI_RECORD_MAX]);
++int cam_wifi_decode(const char *record, struct cam_wifi_config *out);
++/* All times are unsigned ticks; subtraction survives counter wrap. */
++struct cam_auto_policy { uint32_t join_at, server_at; int tried, server_tried, was_ready; };
++#define CAM_AUTO_JOIN 1
++#define CAM_AUTO_RTSP 2
++unsigned cam_auto_step(struct cam_auto_policy *p, uint32_t now, uint32_t retry,
++                       int configured, int changed, int ready, int server);
++#endif
+diff --git a/test/camera_probe.c b/test/camera_probe.c
+new file mode 100644
+index 0000000..aa80337
+--- /dev/null
++++ b/test/camera_probe.c
+@@ -0,0 +1,323 @@
++#include "include.h"
++#include <rtthread.h>
++#include <rthw.h>
++#include <string.h>
++#include "finsh.h"
++#include "camera_intf_pub.h"
++
++#if CFG_USE_CAMERA_INTF && (CFG_SOC_NAME == SOC_BK7221U)
++
++/* Deliberately independent of the vendor I2C drivers: both have unbounded
++ * waits, and I2C2 does not propagate errors. Never drive either line high. */
++#define CP_REG(a) (*(volatile rt_uint32_t *)(a))
++#define CP_GPIO 0x00802800u
++#define CP_IRQ  0x00802040u
++#define CP_PWD  0x00802008u
++#define CP_JPEG0 0x0080a000u
++#define CP_JPEG1 0x0080a004u
++#define CP_IRQ_MASK ((1u << 2) | (1u << 5) | (1u << 29))
++#define CP_JPEG_PWD (1u << 22)
++#define CP_RELEASE 0x3cu
++#define CP_TIMEOUT (-2)
++#define CP_NACK (-1)
++
++extern camera_sensor_t *camera_sensor;
++extern void camera_power_on(void);
++static int probe_running;
++
++struct cp_bus {
++    unsigned scl, sda;
++    rt_tick_t start;
++};
++
++static rt_uint32_t cp_pin(unsigned pin)
++{
++    return CP_GPIO + 4u * (pin < 32 ? pin : pin + 16);
++}
++
++static void cp_mask(rt_uint32_t addr, rt_uint32_t mask, rt_uint32_t bits)
++{
++    rt_base_t level = rt_hw_interrupt_disable();
++    CP_REG(addr) = (CP_REG(addr) & ~mask) | (bits & mask);
++    rt_hw_interrupt_enable(level);
++}
++
++static void cp_line(unsigned pin, int release)
++{
++    CP_REG(cp_pin(pin)) = release ? CP_RELEASE : 0;
++}
++
++static int cp_level(unsigned pin)
++{
++    return (CP_REG(cp_pin(pin)) & 1) != 0;
++}
++
++static void cp_pause(void)
++{
++    rt_thread_delay(1);
++}
++
++static int cp_high(struct cp_bus *b)
++{
++    rt_tick_t start = rt_tick_get();
++    cp_line(b->scl, 1);
++    while (!cp_level(b->scl)) {
++        if ((rt_tick_t)(rt_tick_get() - start) >= RT_TICK_PER_SECOND / 20 + 1)
++            return CP_TIMEOUT;
++        cp_pause();
++    }
++    cp_pause();
++    return 0;
++}
++
++static int cp_start(struct cp_bus *b)
++{
++    cp_line(b->sda, 1);
++    cp_pause();
++    if (cp_high(b)) return CP_TIMEOUT;
++    if (!cp_level(b->sda)) return CP_TIMEOUT;
++    cp_line(b->sda, 0);
++    cp_pause();
++    cp_line(b->scl, 0);
++    return 0;
++}
++
++static int cp_stop(struct cp_bus *b)
++{
++    int result;
++    cp_line(b->scl, 0);
++    cp_line(b->sda, 0);
++    cp_pause();
++    result = cp_high(b);
++    cp_line(b->sda, 1);
++    cp_pause();
++    return result ? result : (cp_level(b->sda) ? 0 : CP_TIMEOUT);
++}
++
++static int cp_write(struct cp_bus *b, unsigned value)
++{
++    unsigned i;
++    int ack;
++    for (i = 0; i < 8; ++i) {
++        cp_line(b->sda, (value & 0x80) != 0);
++        cp_pause();
++        if (cp_high(b)) return CP_TIMEOUT;
++        cp_line(b->scl, 0);
++        value <<= 1;
++    }
++    cp_line(b->sda, 1);
++    cp_pause();
++    if (cp_high(b)) return CP_TIMEOUT;
++    ack = !cp_level(b->sda);
++    cp_line(b->scl, 0);
++    return ack ? 0 : CP_NACK;
++}
++
++static int cp_read(struct cp_bus *b, unsigned *value)
++{
++    unsigned i, result = 0;
++    cp_line(b->sda, 1);
++    for (i = 0; i < 8; ++i) {
++        cp_pause();
++        if (cp_high(b)) return CP_TIMEOUT;
++        result = (result << 1) | cp_level(b->sda);
++        cp_line(b->scl, 0);
++    }
++    /* NACK the single byte to finish the read. */
++    cp_pause();
++    if (cp_high(b)) return CP_TIMEOUT;
++    cp_line(b->scl, 0);
++    *value = result;
++    return 0;
++}
++
++static int cp_register(struct cp_bus *b, unsigned addr, unsigned reg,
++                       unsigned *value, int split)
++{
++    int result = cp_start(b);
++    if (!result) result = cp_write(b, addr << 1);
++    /* OV5640 uses a two-byte register pointer, MSB first. */
++    if (!result && reg > 0xff) result = cp_write(b, reg >> 8);
++    if (!result) result = cp_write(b, reg & 0xff);
++    /* Some SCCB sensors need STOP between pointer write and read. */
++    if (!result && split) result = cp_stop(b);
++    if (!result) result = cp_start(b);
++    if (!result) result = cp_write(b, (addr << 1) | 1);
++    if (!result) result = cp_read(b, value);
++    if (cp_stop(b)) result = CP_TIMEOUT;
++    return result;
++}
++
++static void cp_ov5640(struct cp_bus *b, unsigned addr)
++{
++    unsigned regs[2] = {0x300a, 0x300b};
++    int values[2] = {-1, -1};
++    unsigned i, first, second;
++    int result, split;
++    rt_kprintf("  checking OV5640: 16-bit register pointers\n");
++    for (i = 0; i < 2; ++i) {
++        split = 0;
++        result = cp_register(b, addr, regs[i], &first, split);
++        if (result == CP_NACK) {
++            split = 1;
++            result = cp_register(b, addr, regs[i], &first, split);
++        }
++        if (!result) result = cp_register(b, addr, regs[i], &second, split);
++        if (result) rt_kprintf("  reg 0x%04x: %s\n", regs[i],
++                              result == CP_TIMEOUT ? "timeout/bus stuck" : "NACK");
++        else if (first != second) rt_kprintf("  reg 0x%04x: unstable %02x/%02x\n", regs[i], first, second);
++        else {
++            values[i] = first;
++            rt_kprintf("  reg 0x%04x = 0x%02x%s\n", regs[i], first, split ? " (SCCB STOP)" : "");
++        }
++        if (result == CP_TIMEOUT) break;
++    }
++    if (values[0] == 0x56 && values[1] == 0x40)
++        rt_kprintf("  ID match: OV5640 (0x5640); capture driver not yet added\n");
++    else rt_kprintf("  OV5640 not confirmed; no 8-bit register probe at this address\n");
++}
++
++static void cp_fingerprint(struct cp_bus *b, unsigned addr)
++{
++    static const unsigned regs[] = {0x00, 0x04, 0xf0, 0x0a, 0x0b, 0x1c, 0x1d};
++    int values[7];
++    unsigned i, first, second;
++    int result, split;
++    if (addr == 0x3c) {
++        cp_ov5640(b, addr);
++        return;
++    }
++    for (i = 0; i < 7; ++i) {
++        split = 0;
++        result = cp_register(b, addr, regs[i], &first, split);
++        if (result == CP_NACK) {
++            split = 1;
++            result = cp_register(b, addr, regs[i], &first, split);
++        }
++        if (!result) result = cp_register(b, addr, regs[i], &second, split);
++        values[i] = !result && first == second ? (int)first : -1;
++        if (result) rt_kprintf("  reg 0x%02x: %s\n", regs[i],
++                              result == CP_TIMEOUT ? "timeout/bus stuck" : "NACK");
++        else if (first != second) rt_kprintf("  reg 0x%02x: unstable %02x/%02x\n", regs[i], first, second);
++        else rt_kprintf("  reg 0x%02x = 0x%02x%s\n", regs[i], first, split ? " (SCCB STOP)" : "");
++        if (result == CP_TIMEOUT) break;
++    }
++    if (i != 7) {
++        rt_kprintf("  fingerprint incomplete\n");
++        return;
++    }
++    if (addr == 0x30 && values[1] == 0x96)
++        rt_kprintf("  ID match: HI704 (driver present)\n");
++    else if (addr == 0x21 && values[2] == 0x9d)
++        rt_kprintf("  ID match: GC0328C (driver present)\n");
++    else if (addr == 0x33 && values[2] == 0xbb)
++        rt_kprintf("  ID match: GC0311 (driver present)\n");
++    else if (values[5] == 0x7f && values[6] == 0xa2 &&
++             values[3] == 0x76 && values[4] == 0x73)
++        rt_kprintf("  ID match: OV7670 candidate (no driver selected)\n");
++    else if (values[5] == 0x7f && values[6] == 0xa2)
++        rt_kprintf("  OmniVision manufacturer ID candidate; model unknown\n");
++    else rt_kprintf("  unknown device; ACK alone does not identify a sensor\n");
++}
++
++static void cp_scan(unsigned bus)
++{
++    struct cp_bus b;
++    unsigned addr, count = 0;
++    rt_uint32_t scl_saved, sda_saved;
++    int result;
++    b.scl = bus == 1 ? 20 : 0;
++    b.sda = bus == 1 ? 21 : 1;
++    b.start = rt_tick_get();
++    scl_saved = CP_REG(cp_pin(b.scl));
++    sda_saved = CP_REG(cp_pin(b.sda));
++    cp_line(b.scl, 1);
++    cp_line(b.sda, 1);
++    cp_pause();
++    rt_kprintf("I2C%u: SCL=GPIO%u SDA=GPIO%u, idle=%d/%d\n",
++               bus, b.scl, b.sda, cp_level(b.scl), cp_level(b.sda));
++    if (!cp_level(b.scl) || !cp_level(b.sda)) {
++        rt_kprintf("  bus held low; skipped (no forced recovery pulses)\n");
++        goto restore;
++    }
++    for (addr = 0x08; addr <= 0x77; ++addr) {
++        if ((rt_tick_t)(rt_tick_get() - b.start) >= 60u * RT_TICK_PER_SECOND) {
++            rt_kprintf("  60s scan limit reached; remaining addresses skipped\n");
++            break;
++        }
++        result = cp_start(&b);
++        if (!result) result = cp_write(&b, addr << 1);
++        if (cp_stop(&b)) result = CP_TIMEOUT;
++        if (result == CP_TIMEOUT) {
++            rt_kprintf("  timeout/bus stuck at address 0x%02x; scan aborted\n", addr);
++            break;
++        }
++        if (!result) {
++            ++count;
++            rt_kprintf("  ACK address 7-bit=0x%02x (write byte=0x%02x)\n", addr, addr << 1);
++            cp_fingerprint(&b, addr);
++        }
++    }
++    rt_kprintf("  found %u responding address(es)\n", count);
++restore:
++    CP_REG(cp_pin(b.scl)) = scl_saved;
++    CP_REG(cp_pin(b.sda)) = sda_saved;
++}
++
++static int cam_probe(int argc, char **argv)
++{
++    static const unsigned pins[] = {27, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39};
++    rt_uint32_t pin_saved[12], irq, pwd, jpeg0, jpeg1, mux2, mux3, i2c1, i2c2;
++    unsigned i, bus = 0;
++    rt_base_t level;
++    if (argc > 2 || (argc == 2 && strcmp(argv[1], "all") &&
++                     strcmp(argv[1], "1") && strcmp(argv[1], "2"))) {
++        rt_kprintf("Usage: cam_probe [all|1|2]\n");
++        return -1;
++    }
++    if (argc == 2 && !strcmp(argv[1], "1")) bus = 1;
++    if (argc == 2 && !strcmp(argv[1], "2")) bus = 2;
++    level = rt_hw_interrupt_disable();
++    if (probe_running || camera_sensor || rt_thread_find("video_intf")) {
++        rt_hw_interrupt_enable(level);
++        rt_kprintf("Camera/probe active. Reboot and run cam_probe before starting video.\n");
++        return -1;
++    }
++    probe_running = 1;
++    rt_hw_interrupt_enable(level);
++
++    irq = CP_REG(CP_IRQ);
++    pwd = CP_REG(CP_PWD);
++    jpeg0 = CP_REG(CP_JPEG0);
++    jpeg1 = CP_REG(CP_JPEG1);
++    mux2 = CP_REG(CP_GPIO + 46 * 4);
++    mux3 = CP_REG(CP_GPIO + 47 * 4);
++    for (i = 0; i < 12; ++i) pin_saved[i] = CP_REG(cp_pin(pins[i]));
++    i2c1 = CP_REG(0x00802300u);
++    i2c2 = CP_REG(0x00802600u);
++    cp_mask(CP_IRQ, CP_IRQ_MASK, 0);
++    cp_mask(0x00802300u, 1u, 0);
++    cp_mask(0x00802600u, 1u << 31, 0);
++    cp_mask(CP_JPEG0, (3u << 2) | (3u << 4), 0);
++    camera_power_on();
++    rt_thread_delay(RT_TICK_PER_SECOND / 50 + 1);
++    rt_kprintf("cam_probe: temporary 24MHz camera clock; sensor config unchanged.\n");
++    if (!bus || bus == 1) cp_scan(1);
++    if (!bus || bus == 2) cp_scan(2);
++
++    CP_REG(CP_JPEG1) = jpeg1;
++    CP_REG(CP_JPEG0) = jpeg0;
++    for (i = 0; i < 12; ++i) CP_REG(cp_pin(pins[i])) = pin_saved[i];
++    /* DVP function fields changed by camera_power_on: pin 27 and 29..39. */
++    cp_mask(CP_GPIO + 46 * 4, (3u << 22) | (0x3fu << 26), mux2);
++    cp_mask(CP_GPIO + 47 * 4, 0xffffu, mux3);
++    cp_mask(CP_PWD, CP_JPEG_PWD, pwd);
++    cp_mask(0x00802300u, 1u, i2c1);
++    cp_mask(0x00802600u, 1u << 31, i2c2);
++    cp_mask(CP_IRQ, CP_IRQ_MASK, irq);
++    probe_running = 0;
++    rt_kprintf("cam_probe done; GPIO/clock/controller state restored.\n");
++    return 0;
++}
++MSH_CMD_EXPORT(cam_probe, Scan I2C1/I2C2 and read camera ID candidates);
++#endif
+diff --git a/test/test_config.h b/test/test_config.h
+index 3457275..35153dd 100644
+--- a/test/test_config.h
++++ b/test/test_config.h
+@@ -38,19 +38,19 @@
+ #define I2C_TEST
+ 
+ /**/
+-#define I2S_RTT_TEST
++//#define I2S_RTT_TEST
+ 
+ /**/
+-#define I2S_TEST
++//#define I2S_TEST
+ 
+ /**/
+-#define MIC_DAC_LOOP_TEST
++//#define MIC_DAC_LOOP_TEST
+ 
+ /**/
+-#define MICPHONE_TEST
++//#define MICPHONE_TEST
+ 
+ /**/
+-#define PLAY_LIST_TEST
++//#define PLAY_LIST_TEST
+ 
+ /**/
+ #define PWM_TEST
+@@ -58,7 +58,7 @@
+ /**/
+ #define QSPI_TEST
+ /**/
+-#define RECORD_COM_TCP_TEST
++//#define RECORD_COM_TCP_TEST
+ /**/
+ #define PM_TEST
+ 
+@@ -80,7 +80,7 @@
+ 
+ #define VIDEO_BUF_TEST
+ #define WEB_CAMERA_TEST
+-#define MICPHONE_TEST
++//#define MICPHONE_TEST
+ 
+ //#define I2C_RTT_TEST
+ 
+diff --git a/test/web_camera.c b/test/web_camera.c
+index e39edb5..d86f7b6 100644
+--- a/test/web_camera.c
++++ b/test/web_camera.c
+@@ -17,6 +17,7 @@
+ #include "test_config.h"
+ 
+ #ifdef WEB_CAMERA_TEST
++extern int cam_rtsp_active(void);
+ #define MJPEG_BOUNDARY "boundarydonotcross"
+ #define MAX_BUF_SIZE    40*1024
+ static int  g_mjpeg_stop = 0;
+@@ -186,6 +187,11 @@ int web_jpeg_stream(int argc, char** argv)
+         return 0;
+     }
+ 
++    if (cam_rtsp_active()) {
++        rt_kprintf("RTSP owns the camera buffer; stop RTSP first\n");
++        return -1;
++    }
++
+     video_buffer_open();
+ 
+     if (strcmp(argv[1], "start") == 0)
+@@ -260,6 +266,11 @@ void save_pic(int argc, char **argv){
+ 
+     if(argc == 2){
+ 
++        if (cam_rtsp_active()) {
++            rt_kprintf("RTSP owns the camera buffer; stop RTSP first\n");
++            return;
++        }
++
+         video_buffer_open();
+ 
+         uint8_t *buf = (uint8_t *) malloc (MAX_BUF_SIZE);

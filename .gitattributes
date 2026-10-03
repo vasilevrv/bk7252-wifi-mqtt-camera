@@ -1,0 +1,2 @@
+# Preserve upstream patch context, including CRLF and whitespace.
+*.patch -text -whitespace

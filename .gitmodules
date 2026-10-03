@@ -1,6 +1,7 @@
 [submodule "bdk_rtt"]
 	path = bdk_rtt
 	url = https://github.com/daniel-dona/bdk_rtt
+	ignore = dirty
 [submodule "hid_download_py"]
 	path = hid_download_py
 	url = https://github.com/OpenBekenIOT/hid_download_py
